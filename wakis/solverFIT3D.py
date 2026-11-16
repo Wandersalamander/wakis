@@ -19,10 +19,18 @@ from .logger import Logger
 from .materials import material_lib
 from .plotting import PlotMixinSolver as PlotMixin
 from .routines import RoutinesMixin
+from .stencil import (
+    CurlStencil,
+    check_curl_stencil,
+    curl_stencil_coefficients,
+    periodic_axes,
+)
 
 try:
     import cupy as cp
-    from cupyx.scipy.sparse import csc_matrix as gpu_sparse_mat
+
+    # CSR: cuSPARSE SpMV is row-oriented; CSC products run as transposed CSR.
+    from cupyx.scipy.sparse import csr_matrix as gpu_sparse_mat
 
     imported_cupyx = True
 except ImportError:
@@ -49,6 +57,7 @@ class SolverFIT3D(PlotMixin, RoutinesMixin, BCsMixin):
         use_stl=False,
         use_conductors=False,
         use_gpu=False,
+        gpu_backend="sparse",
         use_mpi=False,
         use_sibc=False,
         fmax=1e9,
@@ -98,6 +107,14 @@ class SolverFIT3D(PlotMixin, RoutinesMixin, BCsMixin):
             Default is 1 GHz if not set and a wakeSolver object is not provided.
         use_gpu : bool, optional
             Enable GPU acceleration via ``cupyx`` (if available).
+        gpu_backend : {'sparse', 'stencil'}, optional
+            GPU implementation of the two curl operators. ``'sparse'``
+            (default) uses ``cupyx`` CSR matrix-vector products. ``'stencil'``
+            uses matrix-free CUDA kernels (``wakis.stencil``) that read only
+            the fields and two coefficient vectors, which reduces memory
+            traffic. The stencil is verified against the assembled matrices at
+            initialization. Requires ``use_gpu=True`` and float32/float64;
+            CPML boundaries are not supported.
         use_mpi : bool, optional
             Enable MPI execution for a subdivided grid.
         dtype : numpy dtype, optional
@@ -177,6 +194,13 @@ class SolverFIT3D(PlotMixin, RoutinesMixin, BCsMixin):
             raise ValueError(
                 f"Invalid source_type={source_type!r}; expected 'direct' or 'tfsf'."
             )
+        self.gpu_backend = str(gpu_backend).lower()
+        if self.gpu_backend not in ("sparse", "stencil"):
+            raise ValueError(
+                f"Invalid gpu_backend={gpu_backend!r}; expected 'sparse' or 'stencil'."
+            )
+        if self.gpu_backend == "stencil" and not use_gpu:
+            raise ValueError("gpu_backend='stencil' requires use_gpu=True.")
         self.use_conductivity = False  # Will turn true with conductive material or pml
         self.imported_mkl = imported_mkl  # Use MKL backend when available
         self.one_step = self._one_step
@@ -480,11 +504,14 @@ class SolverFIT3D(PlotMixin, RoutinesMixin, BCsMixin):
             if verbose:
                 print("Moving to GPU...")
             if imported_cupyx:
+                if self.gpu_backend == "stencil":
+                    # Reads CPU materials and the BC mask, so before to_gpu().
+                    self._move_curl_to_stencil()
                 self.ieps.to_gpu()
                 self.sigma.to_gpu()
                 if self.activate_cpml:
                     self._move_CPML_to_gpu()
-                else:
+                elif self.gpu_backend == "sparse":
                     self.tDsiDmuiDaC = gpu_sparse_mat(self.tDsiDmuiDaC)
                     self.itDaiDepsDstC = gpu_sparse_mat(self.itDaiDepsDstC)
                 if self.source_type == "tfsf":
@@ -608,6 +635,24 @@ class SolverFIT3D(PlotMixin, RoutinesMixin, BCsMixin):
         self.tf_dyz = mkl_sparse_mat(self.tf_dyz)
         self.tf_dtxz = mkl_sparse_mat(self.tf_dtxz)
         self.tf_dtyz = mkl_sparse_mat(self.tf_dtyz)
+
+    def _move_curl_to_stencil(self):
+        """Replace both curl operators by verified matrix-free GPU stencils."""
+        if self.activate_cpml:
+            raise ValueError(
+                "gpu_backend='stencil' does not support CPML boundaries; "
+                "use gpu_backend='sparse'."
+            )
+        coefficients = curl_stencil_coefficients(self)
+        check_curl_stencil(self, coefficients)
+        shape = (self.Nx, self.Ny, self.Nz)
+        periodic = periodic_axes(self)
+        self.tDsiDmuiDaC = CurlStencil(
+            shape, coefficients["r_h"], coefficients["c_h"], periodic, False, self.dtype
+        )
+        self.itDaiDepsDstC = CurlStencil(
+            shape, coefficients["r_e"], coefficients["c_e"], periodic, True, self.dtype
+        )
 
     def _move_tfsf_to_gpu(self):
         if not self.activate_cpml:
@@ -820,9 +865,9 @@ class SolverFIT3D(PlotMixin, RoutinesMixin, BCsMixin):
             if self.source_type == "direct" or self.use_conductivity:
                 self.J_old = np.zeros_like(self.J.toarray())
 
-        self.H.fromarray(
-            self.H.toarray() - self.dt * self.tDsiDmuiDaC * self.E.toarray()
-        )
+        # Parenthesized so dt scales the result vector, not a copy of the
+        # sparse operator, on every step.
+        self.H.array -= self.dt * (self.tDsiDmuiDaC * self.E.array)
 
         if self.source_type == "tfsf":
             if not self.injection_done:
@@ -840,13 +885,8 @@ class SolverFIT3D(PlotMixin, RoutinesMixin, BCsMixin):
             self.J.fromarray(self.J.toarray() + dJ)
             self.J_old = Jtemp
 
-        self.E.fromarray(
-            self.E.toarray()
-            + self.dt
-            * (
-                self.itDaiDepsDstC * self.H.toarray()
-                - self.ieps.toarray() * self.J.toarray()
-            )
+        self.E.array += self.dt * (
+            self.itDaiDepsDstC * self.H.array - self.ieps.array * self.J.array
         )
 
         if self.source_type == "tfsf":
@@ -1480,9 +1520,9 @@ class SolverFIT3D(PlotMixin, RoutinesMixin, BCsMixin):
             if self.source_type == "direct" or self.use_conductivity:
                 self.J_old = np.zeros_like(self.J.toarray())
 
-        self.H.fromarray(
-            self.H.toarray() - self.dt * self.tDsiDmuiDaC * self.E.toarray()
-        )
+        # Parenthesized so dt scales the result vector, not a copy of the
+        # sparse operator, on every step.
+        self.H.array -= self.dt * (self.tDsiDmuiDaC * self.E.array)
 
         if self.source_type == "tfsf":
             if not self.injection_done:
@@ -1501,13 +1541,8 @@ class SolverFIT3D(PlotMixin, RoutinesMixin, BCsMixin):
             self.J.fromarray(self.J.toarray() + dJ)
             self.J_old = Jtemp
         self._mpi_communicate(self.J)
-        self.E.fromarray(
-            self.E.toarray()
-            + self.dt
-            * (
-                self.itDaiDepsDstC * self.H.toarray()
-                - self.ieps.toarray() * self.J.toarray()
-            )
+        self.E.array += self.dt * (
+            self.itDaiDepsDstC * self.H.array - self.ieps.array * self.J.array
         )
 
         if self.source_type == "tfsf":

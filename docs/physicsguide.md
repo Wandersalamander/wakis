@@ -583,6 +583,25 @@ Wakis supports heterogeneous architecture computing thanks to open-source packag
 - Efficient longitudinal domain decomposition with ghost-cell synchronization
 - Seamless integration with **multi-GPU** setups using both `cupy` and `mpi4py` memory passing protocols
 
+#### Matrix-free GPU stencil
+
+Each leapfrog half-step applies one curl operator to a field vector. These products perform only a few flops per value read, so on GPUs their cost is set by memory traffic rather than arithmetic. With `gpu_backend='stencil'`, Wakis replaces the sparse matrix-vector products by CUDA kernels that use the structure of the assembled FIT operators. The operators of Eqs. (3a) and (3b), stored as `tDsiDmuiDaC` ($\mathbf{K}_h$) and `itDaiDepsDstC` ($\mathbf{K}_e$), are both a fixed $\pm 1$ curl stencil between two diagonal scalings:
+
+$$
+\begin{align}
+\mathbf{K}_h &= \operatorname{diag}(\mathbf{r}_h)\, \mathbf{C}_0 \operatorname{diag}(\mathbf{c}_h), &
+\mathbf{r}_h &= \mathbf{a}^{-1} \odot \boldsymbol{\mu}^{-1}, & \mathbf{c}_h &= \mathbf{b} \odot \mathbf{l}, \\
+\mathbf{K}_e &= \operatorname{diag}(\mathbf{r}_e)\, \mathbf{C}_0^{T} \operatorname{diag}(\mathbf{c}_e), &
+\mathbf{r}_e &= \boldsymbol{\varepsilon}^{-1} \odot \tilde{\mathbf{a}}^{-1} \odot \mathbf{b}, & \mathbf{c}_e &= \tilde{\mathbf{l}},
+\end{align}
+$$
+
+where $\odot$ is the elementwise product and the vectors correspond to the `Field` objects `iA`, `imu`, `L`, `ieps`, `itA` and `tL`. $\mathbf{b}$ is the 0/1 boundary mask `BC`, which zeroes tangential $E$ on PEC faces and the inactive high-side copies of periodic faces. $\mathbf{C}_0$ is the unmasked curl assembled from the forward differences $\mathbf{P}_{x,y,z}$. Its rows are zero at terminal storage nodes, and on periodic axes the last physical node connects to node 0 (period $N-1$). Materials, graded meshes, PEC solids ($\varepsilon^{-1} = 0$), SIBC and boundary masks therefore all enter through the coefficient vectors, and the kernels only encode the index pattern of $\mathbf{C}_0$.
+
+One kernel thread per primal node computes all three components of $\mathbf{r} \odot \mathbf{C}_0 (\mathbf{c} \odot \mathbf{x})$, or of the transposed product, from neighbouring values. Instead of the sparse matrix's values and indices, it reads two coefficient vectors, roughly halving the bytes moved per product. The update is algebraically identical to the sparse backend; results differ only by floating-point summation order.
+
+The sparse assembly remains the reference implementation. At initialization, `wakis.stencil.check_curl_stencil` rebuilds both factorizations and compares them with the assembled matrices. If a boundary or material model adds a term that is not a diagonal scaling of the curl, the solver raises an error instead of dropping it. CPML uses split directional operators with auxiliary convolution fields, so it is not supported by the stencil backend.
+
 ```{note}
 #### 👩‍💻 Developer Notes about Wakis
 - Fully open-source and available on [GitHub](https://github.com/ImpedanCEI/wakis)

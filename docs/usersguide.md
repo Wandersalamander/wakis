@@ -184,6 +184,14 @@ solver = SolverFIT3D(
 
 ```
 
+#### GPU backends
+With `use_gpu=True`, the curl operators run as `cupyx` sparse matrix products by default (`gpu_backend='sparse'`). Passing `gpu_backend='stencil'` uses matrix-free CUDA kernels instead. They give the same fields up to rounding with less memory traffic per time step. The stencil is checked against the assembled operators when the solver is created, and CPML boundaries are not supported. `examples/007_GPU_backend_benchmark.py` compares both backends on your GPU.
+
+```python
+solver = SolverFIT3D(grid=grid, bc_low=bc_low, bc_high=bc_high,
+                     use_stl=True, use_gpu=True, gpu_backend='stencil')
+```
+
 #### Simulation timestep
 The solver calculates `solver.dt` from the smallest cell width in each direction and the CFL number. Conductivity can impose a smaller timestep. To specify a timestep explicitly, pass `dt=...` when constructing `SolverFIT3D`.
 

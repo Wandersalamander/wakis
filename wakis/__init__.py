@@ -13,6 +13,7 @@ from . import (
     materials,
     solverFIT3D,
     sources,
+    stencil,
     wakeSolver,
 )
 from ._version import __version__

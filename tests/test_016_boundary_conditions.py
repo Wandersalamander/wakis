@@ -413,3 +413,100 @@ def test_unpaired_periodic_rejected():
         SolverFIT3D(
             grid, bc_low=["pec"] * 3, bc_high=["pec", "pec", "periodic"], verbose=0
         )
+
+
+STENCIL_BOUNDARIES = [
+    ["pec"] * 3,
+    ["pmc"] * 3,
+    ["periodic"] * 3,
+    ["pec", "pmc", "periodic"],
+    ["periodic", "pec", "abc"],
+]
+
+
+def _heterogeneous_solver(bcs, **kwargs):
+    """Graded mesh with vacuum, a lossy shell and a PEC background (ieps = 0)."""
+    rng = np.random.default_rng(2)
+
+    def graded(low, high, cells):
+        widths = rng.uniform(0.5, 1.5, cells)
+        return low + (high - low) * np.r_[0.0, np.cumsum(widths)] / widths.sum()
+
+    grid = GridFIT3D(
+        x=graded(-0.26, 0.26, 8),
+        y=graded(-0.26, 0.26, 8),
+        z=graded(-0.25, 0.55, 11),
+        stl_solids={
+            "cavity": "tests/stl/007_vacuum_cavity.stl",
+            "shell": "tests/stl/007_lossymetal_shell.stl",
+        },
+        stl_materials={"cavity": "vacuum", "shell": [30, 1.0, 30]},
+        verbose=0,
+    )
+    return SolverFIT3D(
+        grid,
+        bc_low=bcs.copy(),
+        bc_high=bcs.copy(),
+        use_stl=True,
+        bg="pec",
+        verbose=0,
+        **kwargs,
+    )
+
+
+@pytest.mark.parametrize("bcs", STENCIL_BOUNDARIES)
+def test_curl_stencil_factorization(bcs):
+    """Assembled curl operators match the matrix-free GPU stencil.
+
+    The GPU stencil backend reads ``diag(r) C0 diag(c)`` from two coefficient
+    vectors instead of the sparse matrices. This must hold for every boundary
+    type and for heterogeneous materials on a graded mesh, so a future change
+    to the assembly that breaks the factorization fails here on CPU CI
+    rather than silently on GPU.
+    """
+    from wakis.stencil import check_curl_stencil, curl_stencil_coefficients
+
+    solver = _heterogeneous_solver(bcs)
+    check_curl_stencil(solver, curl_stencil_coefficients(solver))
+
+
+def test_curl_stencil_rejects_extra_terms():
+    """A non-stencil operator term makes the stencil check raise."""
+    from wakis.stencil import check_curl_stencil, curl_stencil_coefficients
+
+    solver = make_solver(["pec"] * 3)
+    coefficients = curl_stencil_coefficients(solver)
+    operator = solver.tDsiDmuiDaC.tolil()
+    operator[0, 3 * solver.N - 1] = abs(operator).max()
+    solver.tDsiDmuiDaC = operator.tocsr()
+    with pytest.raises(ValueError, match="not a diagonally scaled curl stencil"):
+        check_curl_stencil(solver, coefficients)
+
+
+@pytest.mark.parametrize("dtype,rtol", [(np.float64, 1e-10), (np.float32, 1e-4)])
+@pytest.mark.parametrize("bcs", STENCIL_BOUNDARIES)
+def test_gpu_stencil_matches_sparse(use_gpu, bcs, dtype, rtol):
+    """GPU stencil and sparse backends evolve identical fields.
+
+    Both backends start from the same random E on a heterogeneous graded
+    mesh whose conductive shell exercises the J term. The operators are
+    algebraically identical, so the fields may differ only by rounding
+    accumulated over the steps.
+    """
+    if not use_gpu:
+        pytest.skip("requires --gpu")
+    fields = {}
+    for backend in ("sparse", "stencil"):
+        solver = _heterogeneous_solver(
+            bcs, use_gpu=True, gpu_backend=backend, dtype=dtype
+        )
+        initial = np.random.default_rng(3).normal(size=3 * solver.N)
+        solver.E.fromarray(solver.E.xp.asarray(initial, dtype=dtype))
+        for _ in range(50):
+            solver.one_step()
+        fields[backend] = [field.toarray().get() for field in (solver.E, solver.H)]
+
+    for sparse, stencil in zip(fields["sparse"], fields["stencil"]):
+        np.testing.assert_allclose(
+            stencil, sparse, rtol=0, atol=rtol * np.abs(sparse).max()
+        )
