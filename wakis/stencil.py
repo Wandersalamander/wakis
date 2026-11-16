@@ -31,6 +31,9 @@ import numpy as np
 from scipy.sparse import coo_matrix, diags, hstack, vstack
 
 _THREADS_PER_BLOCK = 256
+# fused_step: (x, y) thread block; each thread marches _FUSED_CHUNK z-planes.
+_FUSED_BLOCK = (32, 8, 1)
+_FUSED_CHUNK = 16
 _AXES = "xyz"
 
 
@@ -158,7 +161,7 @@ def periodic_axes(solver):
     return tuple(bc.lower() == "periodic" for bc in solver.bc_low)
 
 
-def check_curl_stencil(solver, coefficients, rtol=1e-12):
+def check_curl_stencil(solver, coefficients, rtol=None):
     """Verify that the assembled operators are the pure curl stencil.
 
     This is the guard that lets the sparse assembly remain the source of
@@ -175,7 +178,10 @@ def check_curl_stencil(solver, coefficients, rtol=1e-12):
         Output of :func:`curl_stencil_coefficients`.
     rtol : float, optional
         Tolerance relative to the largest operator entry. The two
-        representations differ only by floating-point product order.
+        representations differ only by floating-point product order, so the
+        default is ``max(1e-12, 16 * eps)`` of the operator dtype (float32
+        operators differ by ~1 ulp). A missing or extra term is an O(1)
+        relative deviation and is still caught.
 
     Raises
     ------
@@ -184,9 +190,12 @@ def check_curl_stencil(solver, coefficients, rtol=1e-12):
     """
     for name, operator, rebuilt in _stencil_operators(solver, coefficients):
         operator = operator.tocsr()  # CPML operators are stored as DIA
+        tol = rtol
+        if tol is None:
+            tol = max(1e-12, 16 * float(np.finfo(operator.dtype).eps))
         scale = abs(operator).max()
         error = abs(operator - rebuilt).max()
-        if error > rtol * scale:
+        if error > tol * scale:
             raise ValueError(
                 f"{name} is not a diagonally scaled curl stencil (max deviation "
                 f"{error:.3e} vs. scale {scale:.3e}). The boundary or material "
@@ -398,3 +407,71 @@ class CPMLStencil:
         ``dtxzHy``; None when no injection is active.
         """
         self._apply("E", E, H, ieps, dt, t_a, t_b)
+
+
+class FusedStencilStep:
+    """Single-pass GPU leapfrog step (H then E) for the non-CPML path.
+
+    Launches ``fused_step`` once per time step instead of two curl kernels
+    plus the elementwise update passes. Each thread recomputes the new H at
+    its backward neighbours, so the kernel needs distinct input and output
+    buffers: :meth:`__call__` writes into spare arrays and swaps them into
+    ``E.array``/``H.array``. References to a field array taken before a step
+    therefore point at the spare buffer afterwards.
+
+    Parameters
+    ----------
+    curl_h, curl_e : CurlStencil
+        The solver's ``tDsiDmuiDaC`` and ``itDaiDepsDstC`` stencils, whose
+        coefficient vectors are reused.
+    periodic : tuple of bool
+        Periodic flag per axis.
+    shape : tuple of int
+        Grid shape ``(Nx, Ny, Nz)``.
+    chunk : int, optional
+        Number of z-planes each thread marches through.
+    """
+
+    def __init__(self, curl_h, curl_e, periodic, shape, chunk=_FUSED_CHUNK):
+        import cupy as cp
+
+        self._cp = cp
+        self.dtype = curl_h.dtype
+        self._kernel = _module(self.dtype, False).get_function("fused_step")
+        self._coefficients = (curl_h.row, curl_h.col, curl_e.row, curl_e.col)
+        self.chunk = chunk
+        self._grid = (
+            -(-shape[0] // _FUSED_BLOCK[0]),
+            -(-shape[1] // _FUSED_BLOCK[1]),
+            -(-shape[2] // chunk),
+        )
+        self._args = (
+            *(np.int64(s) for s in shape),
+            *(np.int32(p) for p in periodic),
+            np.int64(chunk),
+        )
+        self._spare = None
+
+    def __call__(self, E, H, ieps, J, dt):
+        """Advance ``E`` and ``H`` (wakis ``Field`` objects) by one step."""
+        cp = self._cp
+        if self._spare is None:
+            self._spare = (cp.empty_like(E.array), cp.empty_like(H.array))
+        E_out, H_out = self._spare
+        self._kernel(
+            self._grid,
+            _FUSED_BLOCK,
+            (
+                E.array,
+                H.array,
+                E_out,
+                H_out,
+                *self._coefficients,
+                ieps,
+                J,
+                self.dtype.type(dt),
+                *self._args,
+            ),
+        )
+        self._spare = (E.array, H.array)
+        E.array, H.array = E_out, H_out

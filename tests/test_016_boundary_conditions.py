@@ -459,19 +459,21 @@ def _heterogeneous_solver(bcs, **kwargs):
     )
 
 
+@pytest.mark.parametrize("dtype", [np.float64, np.float32])
 @pytest.mark.parametrize("bcs", STENCIL_BOUNDARIES)
-def test_curl_stencil_factorization(bcs):
+def test_curl_stencil_factorization(bcs, dtype):
     """Assembled curl operators match the matrix-free GPU stencil.
 
     The GPU stencil backend reads ``diag(r) C0 diag(c)`` from two coefficient
     vectors instead of the sparse matrices. This must hold for every boundary
     type and for heterogeneous materials on a graded mesh, so a future change
     to the assembly that breaks the factorization fails here on CPU CI
-    rather than silently on GPU.
+    rather than silently on GPU. float32 operators differ from the rebuild
+    by rounding, which the check's dtype-aware tolerance must accept.
     """
     from wakis.stencil import check_curl_stencil, curl_stencil_coefficients
 
-    solver = _heterogeneous_solver(bcs)
+    solver = _heterogeneous_solver(bcs, dtype=dtype)
     check_curl_stencil(solver, curl_stencil_coefficients(solver))
 
 
@@ -522,4 +524,54 @@ def test_gpu_stencil_matches_sparse(use_gpu, bcs, dtype, rtol):
     for sparse, stencil in zip(fields["sparse"], fields["stencil"]):
         np.testing.assert_allclose(
             stencil, sparse, rtol=0, atol=rtol * np.abs(sparse).max()
+        )
+
+
+@pytest.mark.parametrize("chunk", [1, 3, 16])
+@pytest.mark.parametrize(
+    "bcs", [b for b in STENCIL_BOUNDARIES if not {"pml", "cpml"} & {*b[0], *b[1]}]
+)
+def test_gpu_fused_step_matches_two_kernel_step(use_gpu, bcs, chunk):
+    """The single-pass fused step equals the two-kernel stencil step.
+
+    ``fused_step`` carries the new H of plane k-1 in registers and recomputes
+    it at chunk starts and periodic wraps; chunk lengths 1 and 3 put chunk
+    boundaries on every few planes so both paths are compared. The
+    conductive shell keeps the J term active.
+    """
+    if not use_gpu:
+        pytest.skip("requires --gpu")
+    from wakis.stencil import FusedStencilStep, periodic_axes
+
+    fields = {}
+    for mode in ("two-kernel", "fused"):
+        solver = _heterogeneous_solver(bcs, use_gpu=True, gpu_backend="stencil")
+        assert hasattr(solver, "fused_step")
+        if mode == "fused":
+            solver.fused_step = FusedStencilStep(
+                solver.tDsiDmuiDaC,
+                solver.itDaiDepsDstC,
+                periodic_axes(solver),
+                (solver.Nx, solver.Ny, solver.Nz),
+                chunk,
+            )
+        else:
+            # Swap only the innermost step; the ABC wrapper sits inside the
+            # periodic wrapper.
+            for name in ("_one_step_backend", "_one_step_periodic", "one_step"):
+                if getattr(solver, name, None) == solver._one_step_fused_stencil:
+                    setattr(solver, name, solver._one_step)
+                    break
+            else:
+                raise AssertionError("fused step is not in the step chain")
+        rng = np.random.default_rng(5)
+        for field in (solver.E, solver.H):
+            field.fromarray(field.xp.asarray(rng.normal(size=3 * solver.N)))
+        for _ in range(30):
+            solver.one_step()
+        fields[mode] = [field.toarray().get() for field in (solver.E, solver.H)]
+
+    for reference, fused in zip(fields["two-kernel"], fields["fused"]):
+        np.testing.assert_allclose(
+            fused, reference, rtol=0, atol=1e-12 * np.abs(reference).max()
         )

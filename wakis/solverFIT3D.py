@@ -22,6 +22,7 @@ from .routines import RoutinesMixin
 from .stencil import (
     CPMLStencil,
     CurlStencil,
+    FusedStencilStep,
     check_curl_stencil,
     curl_stencil_coefficients,
     periodic_axes,
@@ -669,6 +670,13 @@ class SolverFIT3D(PlotMixin, RoutinesMixin, BCsMixin):
             kappa=k_e,
         )
         if not self.activate_cpml:
+            # TFSF injects between the H and E updates and MPI exchanges
+            # halos there, so only the plain step runs as a single pass.
+            if self.source_type != "tfsf" and not self.use_mpi:
+                self.fused_step = FusedStencilStep(
+                    self.tDsiDmuiDaC, self.itDaiDepsDstC, periodic, shape
+                )
+                self.one_step = self._one_step_fused_stencil
             return
         self.cpml_stencil = CPMLStencil(self, coefficients)
         for name in ("dxy", "dxz", "dyx", "dyz", "dzx", "dzy"):
@@ -1196,6 +1204,28 @@ class SolverFIT3D(PlotMixin, RoutinesMixin, BCsMixin):
 
         if self.use_mpi:
             self._mpi_communicate(self.E)
+
+    def _one_step_fused_stencil(self):
+        """``_one_step`` as a single fused GPU kernel (stencil backend).
+
+        Same update as ``_one_step`` without TFSF: the conductivity current
+        is advanced from the old E first, then ``fused_step`` computes H and
+        E in one pass and swaps the field buffers.
+        """
+        if self.step_0:
+            self._set_ghosts_to_0()
+            self.step_0 = False
+            self._attrcleanup()
+            if self.source_type == "direct" or self.use_conductivity:
+                self.J_old = np.zeros_like(self.J.toarray())
+
+        if self.use_conductivity:
+            Jtemp = self.sigma.toarray() * self.E.toarray()
+            dJ = Jtemp - self.J_old
+            self.J.fromarray(self.J.toarray() + dJ)
+            self.J_old = Jtemp
+
+        self.fused_step(self.E, self.H, self.ieps.array, self.J.array, self.dt)
 
     def _one_step_cpml_stencil(self):
         """CPML leapfrog step of ``_one_step_cpml`` with the GPU stencil backend.

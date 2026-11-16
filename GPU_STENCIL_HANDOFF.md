@@ -4,6 +4,23 @@
 
 Branch: `feature/gpu-stencil-backend`. Written on a machine without an NVIDIA GPU or CuPy, so **none of the GPU code has been executed yet**. Read `AGENTS.md` and `CONTRIBUTING.md` first.
 
+## GPU validation results (RTX 5060 Ti, sm_120, CUDA 13.2 runtime, CuPy 14.2)
+
+- Kernels compile with NVRTC and run. Fixed on the GPU machine: the `check_curl_stencil` tolerance is now dtype-aware (float32 operators failed at 1e-12), and the benchmark script passes `dtype.type` and warms the GPU up before timing.
+- **New: single-pass fused step** (`fused_step` in `stencil_kernels.cu`, `FusedStencilStep`, `SolverFIT3D._one_step_fused_stencil`). It is used automatically by the stencil backend without CPML, TFSF or MPI. It marches z-chunks per (i, j) column, carries H of plane k-1 in registers and swaps E/H buffers after each step. Tested against the two-kernel step with chunk lengths 1, 3 and 16 (`test_gpu_fused_step_matches_two_kernel_step`).
+- `pytest --gpu`: 250 passed, 6 skipped (no mpi4py). The one failure, `test_mpi_load_state` (`load_state` on GPU), fails identically on upstream main. Physics tests with the stencil forced on (test_001, 005, 012, 014, 015): all pass.
+- ms/step, PEC box, median of 3 trials after a 1 s warm-up, same script for both code bases (upstream main = 06e9b05). After 100 steps from identical fields, every branch backend matches upstream to ≤5e-15 (f64) / ≤2e-6 (f32):
+
+  | case | upstream main | sparse | stencil 2-kernel | stencil fused | vs. upstream |
+  |---|---|---|---|---|---|
+  | 128³ f64 | 7.28 | 4.86 | 3.08 | 1.31 | 5.6× |
+  | 128³ f32 | 4.05 | 2.74 | 1.46 | 0.65 | 6.2× |
+  | 256³ f64 | 59.3 | 39.3 | 24.9 | 10.9 | 5.5× |
+  | 256³ f32 | 35.1 | 22.5 | 12.2 | 5.2 | 6.7× |
+
+  Modelled fused traffic (10 vectors/step) is 83–86% of the 448 GB/s peak. CSR beats the old CSC on the sparse path, so keep it. CPML/TFSF stencil steps are not benchmarked.
+- Open: at 256³, `check_curl_stencil` takes ~23 s of the stencil setup; Nsight Compute 2025.1 can't read counters with driver R621 (`LibraryNotLoaded`).
+
 ## What the branch changes
 
 1. **`gpu_backend='stencil'`** (new `SolverFIT3D` argument, default `'sparse'`). `wakis/stencil.py` replaces the two cupyx curl matrices (`tDsiDmuiDaC`, `itDaiDepsDstC`) with `CurlStencil` objects. These run matrix-free CUDA kernels and act as drop-in operators for `op * x`. Every existing non-CPML step path (`_one_step`, `_mpi_one_step`, TFSF, conductivity, ABC and periodic wrappers) is unchanged. The math is in `docs/physicsguide.md`, section *Matrix-free GPU stencil*.

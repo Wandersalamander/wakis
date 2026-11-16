@@ -159,3 +159,98 @@ extern "C" __global__ void cpml_psi(
     F[ca * N + n] += scale * mat[ca * N + n] * psi_a[p];
     F[cb * N + n] -= scale * mat[cb * N + n] * psi_b[p];
 }
+
+#ifndef KAPPA
+// Next H component c at node p: H - dt * r_h C0 (c_h E), row c of C0 being
+// +P_{c+1} E_{c+2} - P_{c+2} E_{c+1} (axes and components mod 3).
+__device__ real h_next(const real* E, const real* H, const real* rh,
+                       const real* ch, int c, long long p, const long long* pos,
+                       const long long* len, const long long* stride,
+                       const int* per, long long N, real dt)
+{
+    const int ap = (c + 1) % 3, an = (c + 2) % 3;
+    const long long fp = fwd(p, pos[ap], len[ap], stride[ap], per[ap]);
+    const long long fn = fwd(p, pos[an], len[an], stride[an], per[an]);
+    const real curl = dfwd(E + an * N, ch + an * N, p, fp)
+                    - dfwd(E + ap * N, ch + ap * N, p, fn);
+    return H[c * N + p] - dt * (rh[c * N + p] * curl);
+}
+
+// One complete leapfrog step in a single pass (no CPML):
+//   Ho = H - dt * r_h C0 (c_h E)
+//   Eo = E + dt * (r_e C0.T (c_e Ho) - ieps J)
+// C0.T at node m needs Ho at m and at its backward neighbour along each
+// axis. Each thread owns one (i, j) column and marches k over one chunk of
+// z-planes: Ho at (i, j, k-1) is carried in registers from the previous
+// iteration, the in-plane neighbours (i-1, j, k), (i, j-1, k) and chunk
+// starts or periodic wraps are recomputed from E. No thread depends on
+// another's output, so inputs and outputs must be distinct buffers. The
+// z-march keeps the working set to about one plane per array in cache.
+extern "C" __global__ void fused_step(
+    const real* E, const real* H, real* Eo, real* Ho,
+    const real* rh, const real* ch, const real* re, const real* ce,
+    const real* ieps, const real* J, const real dt,
+    const long long Nx, const long long Ny, const long long Nz,
+    const int px, const int py, const int pz, const long long chunk)
+{
+    const long long i = (long long)blockDim.x * blockIdx.x + threadIdx.x;
+    const long long j = (long long)blockDim.y * blockIdx.y + threadIdx.y;
+    if (i >= Nx || j >= Ny) return;
+    const long long k0 = (long long)blockIdx.z * chunk;
+    const long long k1 = k0 + chunk < Nz ? k0 + chunk : Nz;
+    const long long N = Nx * Ny * Nz;
+    const long long len[3] = {Nx, Ny, Nz};
+    const long long stride[3] = {1, Nx, Nx * Ny};
+    const int per[3] = {px, py, pz};
+
+    real carry[3] = {(real)0, (real)0, (real)0};  // c_e * Ho at (i, j, k-1)
+    int has_carry = 0;
+    for (long long k = k0; k < k1; ++k) {
+        const long long m = i + Nx * (j + Ny * k);
+        const long long pos[3] = {i, j, k};
+
+        real cm[3];  // c_e * Ho at m
+#pragma unroll
+        for (int c = 0; c < 3; ++c) {
+            const real h = h_next(E, H, rh, ch, c, m, pos, len, stride, per, N, dt);
+            Ho[c * N + m] = h;
+            cm[c] = ce[c * N + m] * h;
+        }
+
+        // D[a][s]: (P_a.T (c_e Ho_s))[m], i.e. dbwd along axis a of component s.
+        real D[3][3];
+#pragma unroll
+        for (int a = 0; a < 3; ++a) {
+            const long long nb = bwd(m, pos[a], len[a], stride[a], per[a]);
+            const int terminal = pos[a] == len[a] - 1;
+            long long npos[3] = {pos[0], pos[1], pos[2]};
+            npos[a] = pos[a] > 0 ? pos[a] - 1 : len[a] - 2;
+#pragma unroll
+            for (int s = 0; s < 3; ++s) {
+                if (s == a) continue;
+                real d = terminal ? (real)0 : -cm[s];
+                if (nb >= 0) {
+                    if (a == 2 && has_carry && nb == m - stride[2])
+                        d += carry[s];
+                    else
+                        d += ce[s * N + nb]
+                           * h_next(E, H, rh, ch, s, nb, npos, len, stride, per, N, dt);
+                }
+                D[a][s] = d;
+            }
+        }
+
+        // Row c of C0.T: +P_{c+2}.T Ho_{c+1} - P_{c+1}.T Ho_{c+2}.
+#pragma unroll
+        for (int c = 0; c < 3; ++c) {
+            const int ap = (c + 1) % 3, an = (c + 2) % 3;
+            const real curl = re[c * N + m] * (D[an][ap] - D[ap][an]);
+            Eo[c * N + m] = E[c * N + m] + dt * (curl - ieps[c * N + m] * J[c * N + m]);
+        }
+
+#pragma unroll
+        for (int c = 0; c < 3; ++c) carry[c] = cm[c];
+        has_carry = 1;
+    }
+}
+#endif

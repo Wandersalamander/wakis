@@ -65,15 +65,17 @@ for backend in ("sparse", "stencil"):
         bc_high=["pec"] * 3,
         use_gpu=True,
         gpu_backend=backend,
-        dtype=dtype,
+        dtype=dtype.type,  # SolverFIT3D expects a scalar type, not np.dtype
         verbose=0,
     )
     setup = time.time() - t0
     solver.E.fromarray(cp.asarray(initial, dtype=dtype))
     operator, x = solver.tDsiDmuiDaC, solver.E.array
 
-    t_curl = gpu_time(lambda: operator * x, 50)
+    # Steps first: they bring the GPU to full clocks after the CPU-bound setup,
+    # otherwise the short curl measurement runs partly at idle clocks.
     t_step = gpu_time(solver.one_step, n_steps)
+    t_curl = gpu_time(lambda: operator * x, 200)
     bandwidth = curl_bytes(operator, solver.N, dtype.itemsize) / t_curl
     results[backend] = [field.toarray().get() for field in (solver.E, solver.H)]
 

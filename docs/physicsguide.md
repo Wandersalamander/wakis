@@ -600,6 +600,15 @@ where $\odot$ is the elementwise product and the vectors correspond to the `Fiel
 
 One kernel thread per primal node computes all three components of $\mathbf{r} \odot \mathbf{C}_0 (\mathbf{c} \odot \mathbf{x})$, or of the transposed product, from neighbouring values. Instead of the sparse matrix's values and indices, it reads two coefficient vectors, roughly halving the bytes moved per product. The update is algebraically identical to the sparse backend; results differ only by floating-point summation order.
 
+Without CPML, TFSF injection or MPI, the whole leapfrog step runs as a single kernel (`fused_step`) instead of two curl products plus elementwise updates:
+
+$$
+\mathbf{h}' = \mathbf{h} - \Delta t\, \mathbf{K}_h \mathbf{e}, \qquad
+\mathbf{e}' = \mathbf{e} + \Delta t \left( \mathbf{K}_e \mathbf{h}' - \boldsymbol{\varepsilon}^{-1} \odot \mathbf{j} \right).
+$$
+
+$\mathbf{C}_0^T$ at node $m$ needs $\mathbf{h}'$ at $m$ and at its backward neighbour along each axis. Each thread owns one $(i, j)$ column and marches through a chunk of $z$-planes. It carries $\mathbf{h}'$ of plane $k-1$ in registers and recomputes the in-plane neighbours, chunk starts and periodic wraps from $\mathbf{e}$. Threads never read each other's output, so the kernel writes into spare buffers that are swapped with `E.array` and `H.array` after each step. Every field and coefficient value is then read once and every field value written once per step. The conductivity current is advanced from the old $\mathbf{e}$ before the kernel, as in the unfused step.
+
 The sparse assembly remains the reference implementation. At initialization, `wakis.stencil.check_curl_stencil` rebuilds both factorizations and compares them with the assembled matrices. If a boundary or material model adds a term that is not a diagonal scaling of the curl, the solver raises an error instead of dropping it.
 
 With CPML, the sparse backend builds the 12 directional operators $\mathbf{d}_{ca}$ (component $c$, derivative along $a$), e.g. `dxy` $= \operatorname{diag}(\mathbf{a}_x^{-1} \tilde{\boldsymbol{\kappa}}_y^{-1})\, \mathbf{P}_y \operatorname{diag}(\mathbf{b}_z \odot \mathbf{l}_z)$ for $H_x$ from $E_z$. On the E side, `dtxy` uses $-\mathbf{P}_y^T$ and $\boldsymbol{\kappa}_y^{-1}$. These factor in the same way, with the stretching $1/\kappa_a$ attached to the derivative direction. The stencil backend therefore:
