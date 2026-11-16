@@ -35,6 +35,7 @@ setup(
     },
     packages=find_packages(),
     include_package_data=True,
+    package_data={"wakis": ["stencil_kernels.cu"]},
     classifiers=[
         "Development Status :: 4 - Beta",
         "Programming Language :: Python",

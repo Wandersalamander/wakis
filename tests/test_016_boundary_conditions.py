@@ -415,16 +415,20 @@ def test_unpaired_periodic_rejected():
         )
 
 
-STENCIL_BOUNDARIES = [
-    ["pec"] * 3,
-    ["pmc"] * 3,
-    ["periodic"] * 3,
-    ["pec", "pmc", "periodic"],
-    ["periodic", "pec", "abc"],
+STENCIL_BOUNDARIES = [  # (bc_low, bc_high)
+    (["pec"] * 3,) * 2,
+    (["pmc"] * 3,) * 2,
+    (["periodic"] * 3,) * 2,
+    (["pec", "pmc", "periodic"],) * 2,
+    (["periodic", "pec", "abc"],) * 2,
+    (["pec", "pec", "pml"],) * 2,
+    (["periodic", "periodic", "pec"], ["periodic", "periodic", "cpml"]),
+    (["cpml", "pec", "cpml"], ["pec", "cpml", "cpml"]),
 ]
 
 
 def _heterogeneous_solver(bcs, **kwargs):
+    bc_low, bc_high = bcs
     """Graded mesh with vacuum, a lossy shell and a PEC background (ieps = 0)."""
     rng = np.random.default_rng(2)
 
@@ -445,10 +449,11 @@ def _heterogeneous_solver(bcs, **kwargs):
     )
     return SolverFIT3D(
         grid,
-        bc_low=bcs.copy(),
-        bc_high=bcs.copy(),
+        bc_low=bc_low.copy(),
+        bc_high=bc_high.copy(),
         use_stl=True,
         bg="pec",
+        n_pml=2,
         verbose=0,
         **kwargs,
     )
@@ -488,10 +493,12 @@ def test_curl_stencil_rejects_extra_terms():
 def test_gpu_stencil_matches_sparse(use_gpu, bcs, dtype, rtol):
     """GPU stencil and sparse backends evolve identical fields.
 
-    Both backends start from the same random E on a heterogeneous graded
-    mesh whose conductive shell exercises the J term. The operators are
-    algebraically identical, so the fields may differ only by rounding
-    accumulated over the steps.
+    Both backends start from the same random E and H on a heterogeneous
+    graded mesh whose conductive shell exercises the J term. PML and CPML
+    force TFSF; random incident fields keep its injection active, which
+    also feeds the CPML convolutions. The operators are algebraically
+    identical, so the fields may differ only by rounding accumulated over
+    the steps.
     """
     if not use_gpu:
         pytest.skip("requires --gpu")
@@ -500,8 +507,14 @@ def test_gpu_stencil_matches_sparse(use_gpu, bcs, dtype, rtol):
         solver = _heterogeneous_solver(
             bcs, use_gpu=True, gpu_backend=backend, dtype=dtype
         )
-        initial = np.random.default_rng(3).normal(size=3 * solver.N)
-        solver.E.fromarray(solver.E.xp.asarray(initial, dtype=dtype))
+        rng = np.random.default_rng(3)
+        inputs = [solver.E, solver.H]
+        if solver.source_type == "tfsf":
+            inputs += [solver.E_trans, solver.H_trans]
+            solver.injection_done = False
+        for field in inputs:
+            values = rng.normal(size=3 * solver.N)
+            field.fromarray(field.xp.asarray(values, dtype=dtype))
         for _ in range(50):
             solver.one_step()
         fields[backend] = [field.toarray().get() for field in (solver.E, solver.H)]

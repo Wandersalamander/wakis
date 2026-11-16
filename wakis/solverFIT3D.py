@@ -20,6 +20,7 @@ from .materials import material_lib
 from .plotting import PlotMixinSolver as PlotMixin
 from .routines import RoutinesMixin
 from .stencil import (
+    CPMLStencil,
     CurlStencil,
     check_curl_stencil,
     curl_stencil_coefficients,
@@ -113,8 +114,9 @@ class SolverFIT3D(PlotMixin, RoutinesMixin, BCsMixin):
             uses matrix-free CUDA kernels (``wakis.stencil``) that read only
             the fields and two coefficient vectors, which reduces memory
             traffic. The stencil is verified against the assembled matrices at
-            initialization. Requires ``use_gpu=True`` and float32/float64;
-            CPML boundaries are not supported.
+            initialization. With CPML, the convolution fields are updated
+            by slab-local kernels instead of 12 directional operators.
+            Requires ``use_gpu=True`` and float32/float64.
         use_mpi : bool, optional
             Enable MPI execution for a subdivided grid.
         dtype : numpy dtype, optional
@@ -509,7 +511,7 @@ class SolverFIT3D(PlotMixin, RoutinesMixin, BCsMixin):
                     self._move_curl_to_stencil()
                 self.ieps.to_gpu()
                 self.sigma.to_gpu()
-                if self.activate_cpml:
+                if self.gpu_backend == "sparse" and self.activate_cpml:
                     self._move_CPML_to_gpu()
                 elif self.gpu_backend == "sparse":
                     self.tDsiDmuiDaC = gpu_sparse_mat(self.tDsiDmuiDaC)
@@ -637,22 +639,43 @@ class SolverFIT3D(PlotMixin, RoutinesMixin, BCsMixin):
         self.tf_dtyz = mkl_sparse_mat(self.tf_dtyz)
 
     def _move_curl_to_stencil(self):
-        """Replace both curl operators by verified matrix-free GPU stencils."""
-        if self.activate_cpml:
-            raise ValueError(
-                "gpu_backend='stencil' does not support CPML boundaries; "
-                "use gpu_backend='sparse'."
-            )
+        """Replace the curl operators by verified matrix-free GPU stencils.
+
+        With CPML, the 12 directional operators are replaced by the stretched
+        curl stencils plus slab-local psi kernels, and the step switches to
+        ``_one_step_cpml_stencil``.
+        """
         coefficients = curl_stencil_coefficients(self)
         check_curl_stencil(self, coefficients)
         shape = (self.Nx, self.Ny, self.Nz)
         periodic = periodic_axes(self)
+        k_h, k_e = coefficients.get("k_h"), coefficients.get("k_e")
         self.tDsiDmuiDaC = CurlStencil(
-            shape, coefficients["r_h"], coefficients["c_h"], periodic, False, self.dtype
+            shape,
+            coefficients["r_h"],
+            coefficients["c_h"],
+            periodic,
+            False,
+            self.dtype,
+            kappa=k_h,
         )
         self.itDaiDepsDstC = CurlStencil(
-            shape, coefficients["r_e"], coefficients["c_e"], periodic, True, self.dtype
+            shape,
+            coefficients["r_e"],
+            coefficients["c_e"],
+            periodic,
+            True,
+            self.dtype,
+            kappa=k_e,
         )
+        if not self.activate_cpml:
+            return
+        self.cpml_stencil = CPMLStencil(self, coefficients)
+        for name in ("dxy", "dxz", "dyx", "dyz", "dzx", "dzy"):
+            delattr(self, name)
+            delattr(self, "dt" + name[1:])
+        self.imu.to_gpu()
+        self.one_step = self._one_step_cpml_stencil
 
     def _move_tfsf_to_gpu(self):
         if not self.activate_cpml:
@@ -1170,6 +1193,65 @@ class SolverFIT3D(PlotMixin, RoutinesMixin, BCsMixin):
             self.E.field_y[self.idx_z_high] += (
                 self.dt * self.ieps.field_y[self.idx_z_high] * self.psiEa_y_high
             )
+
+        if self.use_mpi:
+            self._mpi_communicate(self.E)
+
+    def _one_step_cpml_stencil(self):
+        """CPML leapfrog step of ``_one_step_cpml`` with the GPU stencil backend.
+
+        The stretched curl stencils give the bulk update, which equals the
+        sum of the directional terms; ``cpml_stencil`` adds the psi
+        convolutions on the face slabs. TFSF terms enter both, as in
+        ``_one_step_cpml``.
+        """
+        if self.step_0:
+            self._set_ghosts_to_0()
+            self.step_0 = False
+            self._attrcleanup()
+            if self.source_type == "direct" or self.use_conductivity:
+                self.J_old = np.zeros_like(self.J.toarray())
+            if self.verbose > 1:
+                print("Starting time-stepping with CPML...")
+
+        inject = self.source_type == "tfsf" and not self.injection_done
+        self.H.array -= self.dt * (self.tDsiDmuiDaC * self.E.array)
+        t_ex = t_ey = None
+        if inject:
+            # Added to dyzEx and dxzEy in _one_step_cpml.
+            t_ex = -(self.tf_dyz * self.E_trans.field_x)
+            t_ey = -(self.tf_dxz * self.E_trans.field_y)
+            self.H.field_x += self.dt * self.imu.field_x * t_ey
+            self.H.field_y -= self.dt * self.imu.field_y * t_ex
+        self.cpml_stencil.update_H(
+            self.H.array, self.E.array, self.imu.array, self.dt, t_ex, t_ey
+        )
+
+        if self.use_mpi:
+            self._mpi_communicate(self.H)
+
+        if self.use_conductivity:
+            Jtemp = self.sigma.toarray() * self.E.toarray()
+            dJ = Jtemp - self.J_old
+            self.J.fromarray(self.J.toarray() + dJ)
+            self.J_old = Jtemp
+
+        if self.use_mpi:
+            self._mpi_communicate(self.J)
+
+        self.E.array += self.dt * (
+            self.itDaiDepsDstC * self.H.array - self.ieps.array * self.J.array
+        )
+        t_hx = t_hy = None
+        if inject:
+            # Added to dtyzHx and dtxzHy in _one_step_cpml.
+            t_hx = self.tf_dtyz * self.H_trans.field_x
+            t_hy = self.tf_dtxz * self.H_trans.field_y
+            self.E.field_x -= self.dt * self.ieps.field_x * t_hy
+            self.E.field_y += self.dt * self.ieps.field_y * t_hx
+        self.cpml_stencil.update_E(
+            self.E.array, self.H.array, self.ieps.array, self.dt, t_hx, t_hy
+        )
 
         if self.use_mpi:
             self._mpi_communicate(self.E)
@@ -1905,6 +1987,9 @@ class SolverFIT3D(PlotMixin, RoutinesMixin, BCsMixin):
             del self.BC
             del self.Dbc
             del self.Dbc_x, self.Dbc_y, self.Dbc_z
+
+        if hasattr(self, "ikappa"):
+            del self.ikappa, self.itkappa
 
         # Matrices
         del self.Px, self.Py, self.Pz

@@ -14,110 +14,32 @@ diagonal scalings (see ``docs/physicsguide.md``, *Matrix-free GPU stencil*):
 ``C0`` is the unmasked curl built from forward differences ``P_x, P_y, P_z``.
 All metrics, materials, PEC masks and periodic seams live in the two
 diagonals, so a GPU kernel only reads the field and two coefficient vectors
-instead of the sparse matrix values and indices.
+instead of the sparse matrix values and indices. The CUDA kernels live in
+``stencil_kernels.cu``; their ``fwd``/``bwd`` neighbour rules must stay
+consistent with :func:`_incidence`, which :func:`check_curl_stencil` compares
+against the assembled solver matrices.
+
+With CPML, the same kernels apply the coordinate stretching 1/kappa per
+derivative direction, and ``cpml_psi`` updates the convolution fields only on
+the boundary slabs, replacing the 12 directional operators ``dxy``..``dtzy``.
 """
+
+from functools import lru_cache
+from pathlib import Path
 
 import numpy as np
 from scipy.sparse import coo_matrix, diags, hstack, vstack
 
-# One thread per primal node computes all three components of
-# r * C0 @ (c * x) (forward) or r * C0.T @ (c * x) (transposed).
-# Node index n = i + Nx*j + Nx*Ny*k (x fastest, as in Field); component d is
-# stored at d*N + n. `fwd`/`bwd` must stay consistent with `_incidence`, which
-# `check_curl_stencil` compares against the assembled solver matrices.
-_KERNEL_SOURCE = r"""
-typedef REAL real;
-
-// Forward neighbour of node n along one axis, or -1 when the node is the
-// terminal storage node and has no forward primal edge. Periodic axes wrap
-// the last physical node (idx == len - 2) to idx = 0, i.e. period len - 1.
-__device__ long long fwd(long long n, long long idx, long long len,
-                         long long stride, int periodic)
-{
-    if (idx == len - 1) return -1;
-    if (periodic && idx == len - 2) return n - idx * stride;
-    return n + stride;
-}
-
-// Node whose forward edge ends at m (rows of P.T), or -1 when there is none.
-__device__ long long bwd(long long m, long long idx, long long len,
-                         long long stride, int periodic)
-{
-    if (idx > 0) {
-        if (periodic && idx == len - 1) return -1;
-        return m - stride;
-    }
-    if (periodic && len > 1) return m + (len - 2) * stride;
-    return -1;
-}
-
-// (P u)[n] = u[fwd(n)] - u[n] for active nodes, 0 for terminal nodes.
-__device__ real dfwd(const real* x, const real* c, long long n, long long nb)
-{
-    return nb < 0 ? (real)0 : c[nb] * x[nb] - c[n] * x[n];
-}
-
-// (P.T u)[m] = -u[m] for active m, plus u[bwd(m)] when it exists.
-__device__ real dbwd(const real* x, const real* c, long long m, long long nb,
-                     int terminal)
-{
-    real out = terminal ? (real)0 : -c[m] * x[m];
-    if (nb >= 0) out += c[nb] * x[nb];
-    return out;
-}
-
-extern "C" __global__ void curl_fwd(
-    const real* x, const real* r, const real* c, real* out,
-    const long long Nx, const long long Ny, const long long Nz,
-    const int px, const int py, const int pz)
-{
-    const long long N = Nx * Ny * Nz;
-    const long long n = (long long)blockDim.x * blockIdx.x + threadIdx.x;
-    if (n >= N) return;
-    const long long i = n % Nx, j = (n / Nx) % Ny, k = n / (Nx * Ny);
-    const long long nx = fwd(n, i, Nx, 1, px);
-    const long long ny = fwd(n, j, Ny, Nx, py);
-    const long long nz = fwd(n, k, Nz, Nx * Ny, pz);
-    const real *x0 = x, *x1 = x + N, *x2 = x + 2 * N;
-    const real *c0 = c, *c1 = c + N, *c2 = c + 2 * N;
-
-    // C0 rows: [0, -Pz, Py], [Pz, 0, -Px], [-Py, Px, 0]
-    out[n] = r[n] * (dfwd(x2, c2, n, ny) - dfwd(x1, c1, n, nz));
-    out[N + n] = r[N + n] * (dfwd(x0, c0, n, nz) - dfwd(x2, c2, n, nx));
-    out[2 * N + n] = r[2 * N + n] * (dfwd(x1, c1, n, nx) - dfwd(x0, c0, n, ny));
-}
-
-extern "C" __global__ void curl_bwd(
-    const real* x, const real* r, const real* c, real* out,
-    const long long Nx, const long long Ny, const long long Nz,
-    const int px, const int py, const int pz)
-{
-    const long long N = Nx * Ny * Nz;
-    const long long m = (long long)blockDim.x * blockIdx.x + threadIdx.x;
-    if (m >= N) return;
-    const long long i = m % Nx, j = (m / Nx) % Ny, k = m / (Nx * Ny);
-    const long long nx = bwd(m, i, Nx, 1, px);
-    const long long ny = bwd(m, j, Ny, Nx, py);
-    const long long nz = bwd(m, k, Nz, Nx * Ny, pz);
-    const int tx = i == Nx - 1, ty = j == Ny - 1, tz = k == Nz - 1;
-    const real *x0 = x, *x1 = x + N, *x2 = x + 2 * N;
-    const real *c0 = c, *c1 = c + N, *c2 = c + 2 * N;
-
-    // C0.T rows: [0, Pz.T, -Py.T], [-Pz.T, 0, Px.T], [Py.T, -Px.T, 0]
-    out[m] = r[m] * (dbwd(x1, c1, m, nz, tz) - dbwd(x2, c2, m, ny, ty));
-    out[N + m] = r[N + m] * (dbwd(x2, c2, m, nx, tx) - dbwd(x0, c0, m, nz, tz));
-    out[2 * N + m] = r[2 * N + m] * (dbwd(x0, c0, m, ny, ty) - dbwd(x1, c1, m, nx, tx));
-}
-"""
-
 _THREADS_PER_BLOCK = 256
+_AXES = "xyz"
 
 
 def curl_stencil_coefficients(solver):
-    """Return the diagonal scalings of the two FIT leapfrog operators.
+    """Return the diagonal scalings of the FIT leapfrog operators.
 
     Must be called after boundary assembly and before the first time step,
-    while ``solver.BC`` (PEC/periodic mask) still exists.
+    while ``solver.BC`` (PEC/periodic mask) and the CPML stretching
+    ``ikappa``/``itkappa`` still exist.
 
     Parameters
     ----------
@@ -127,17 +49,29 @@ def curl_stencil_coefficients(solver):
     Returns
     -------
     dict of ndarray
-        ``r_h, c_h`` and ``r_e, c_e``, each of length ``3*N``, such that
+        Vectors of length ``3*N``: ``r_h, c_h`` and ``r_e, c_e`` such that
         ``tDsiDmuiDaC = diag(r_h) C0 diag(c_h)`` and
-        ``itDaiDepsDstC = diag(r_e) C0.T diag(c_e)``.
+        ``itDaiDepsDstC = diag(r_e) C0.T diag(c_e)``. With CPML also the
+        material-free row scalings ``g_h, g_e`` and the inverse stretchings
+        ``k_h = 1/tkappa`` (H update) and ``k_e = 1/kappa`` (E update).
     """
     mask = solver.BC.toarray() if hasattr(solver, "BC") else 1.0
-    return {
+    coefficients = {
         "r_h": solver.iA.toarray() * solver.imu.toarray(),
         "c_h": mask * solver.L.toarray(),
         "r_e": solver.ieps.toarray() * solver.itA.toarray() * mask,
         "c_e": solver.tL.toarray(),
     }
+    if solver.activate_cpml:
+        # The CPML directional derivatives exclude the material factor, which
+        # the update multiplies in separately.
+        coefficients.update(
+            g_h=solver.iA.toarray(),
+            g_e=solver.itA.toarray() * mask,
+            k_h=solver.itkappa,
+            k_e=solver.ikappa,
+        )
+    return coefficients
 
 
 def _incidence(shape, axis, periodic):
@@ -173,6 +107,52 @@ def _curl(shape, periodic):
     )
 
 
+def _stencil_operators(solver, coefficients):
+    """Yield (name, assembled operator, stencil rebuild) pairs to compare."""
+    shape = (solver.Nx, solver.Ny, solver.Nz)
+    periodic = periodic_axes(solver)
+    if not solver.activate_cpml:
+        curl = _curl(shape, periodic)
+        yield (
+            "tDsiDmuiDaC",
+            solver.tDsiDmuiDaC,
+            diags(coefficients["r_h"]) @ curl @ diags(coefficients["c_h"]),
+        )
+        yield (
+            "itDaiDepsDstC",
+            solver.itDaiDepsDstC,
+            diags(coefficients["r_e"]) @ curl.T @ diags(coefficients["c_e"]),
+        )
+        return
+
+    # CPML: d{c}{a} maps component o = 3-c-a through the derivative along a
+    # into component c, e.g. dxy = iA_x / tkappa_y * P_y * BC_z * L_z.
+    N = solver.N
+
+    def block(name, component):
+        return coefficients[name][component * N : (component + 1) * N]
+
+    for a in range(3):
+        diff = _incidence(shape, a, periodic[a])
+        for c in range(3):
+            if c == a:
+                continue
+            o = 3 - a - c
+            name = _AXES[c] + _AXES[a]
+            row_h = block("g_h", c) * block("k_h", a)
+            row_e = block("g_e", c) * block("k_e", a)
+            yield (
+                "d" + name,
+                getattr(solver, "d" + name),
+                diags(row_h) @ diff @ diags(block("c_h", o)),
+            )
+            yield (
+                "dt" + name,
+                getattr(solver, "dt" + name),
+                diags(row_e) @ -diff.T @ diags(block("c_e", o)),
+            )
+
+
 def periodic_axes(solver):
     """Return the per-axis periodic flags used by the stencil kernels."""
     return tuple(bc.lower() == "periodic" for bc in solver.bc_low)
@@ -184,13 +164,13 @@ def check_curl_stencil(solver, coefficients, rtol=1e-12):
     This is the guard that lets the sparse assembly remain the source of
     truth: if a future boundary or material model adds a term that is not a
     diagonal scaling of the curl, the stencil backend refuses to run instead
-    of silently dropping it.
+    of silently dropping it. Without CPML it checks ``tDsiDmuiDaC`` and
+    ``itDaiDepsDstC``; with CPML the 12 directional operators ``dxy``..``dtzy``.
 
     Parameters
     ----------
     solver : SolverFIT3D
-        Solver whose ``tDsiDmuiDaC`` and ``itDaiDepsDstC`` are still SciPy
-        sparse matrices.
+        Solver whose operators are still SciPy sparse matrices.
     coefficients : dict of ndarray
         Output of :func:`curl_stencil_coefficients`.
     rtol : float, optional
@@ -200,15 +180,10 @@ def check_curl_stencil(solver, coefficients, rtol=1e-12):
     Raises
     ------
     ValueError
-        If either operator differs from its stencil factorization.
+        If an operator differs from its stencil factorization.
     """
-    curl = _curl((solver.Nx, solver.Ny, solver.Nz), periodic_axes(solver))
-    pairs = (
-        ("tDsiDmuiDaC", solver.tDsiDmuiDaC, "r_h", curl, "c_h"),
-        ("itDaiDepsDstC", solver.itDaiDepsDstC, "r_e", curl.T, "c_e"),
-    )
-    for name, operator, row, stencil, col in pairs:
-        rebuilt = diags(coefficients[row]) @ stencil @ diags(coefficients[col])
+    for name, operator, rebuilt in _stencil_operators(solver, coefficients):
+        operator = operator.tocsr()  # CPML operators are stored as DIA
         scale = abs(operator).max()
         error = abs(operator - rebuilt).max()
         if error > rtol * scale:
@@ -218,6 +193,57 @@ def check_curl_stencil(solver, coefficients, rtol=1e-12):
                 "setup added a term the GPU stencil backend does not support; "
                 "use gpu_backend='sparse' or extend wakis/stencil.py."
             )
+
+
+def cpml_faces(solver):
+    """Return, per CPML face, its axis and the solver attribute names it uses.
+
+    Low faces share the slab indices of H and E; high H slabs exclude the
+    terminal storage plane (``idx_H_*_high``).
+    """
+    faces = []
+    for side, bcs in (("low", solver.bc_low), ("high", solver.bc_high)):
+        for axis, name in enumerate(_AXES):
+            if bcs[axis].lower() != "cpml":
+                continue
+            ca, cb = _AXES[(axis + 2) % 3], _AXES[(axis + 1) % 3]
+            idx_h = f"idx_H_{name}_high" if side == "high" else f"idx_{name}_low"
+            faces.append(
+                {
+                    "axis": axis,
+                    "H": {
+                        "idx": idx_h,
+                        "psi_a": f"psiHa_{ca}_{side}",
+                        "psi_b": f"psiHb_{cb}_{side}",
+                        "b": f"pml_b_H_{name}_{side}",
+                        "c": f"pml_c_H_{name}_{side}",
+                    },
+                    "E": {
+                        "idx": f"idx_{name}_{side}",
+                        "psi_a": f"psiEa_{ca}_{side}",
+                        "psi_b": f"psiEb_{cb}_{side}",
+                        "b": f"pml_b_E_{name}_{side}",
+                        "c": f"pml_c_E_{name}_{side}",
+                    },
+                }
+            )
+    return faces
+
+
+@lru_cache(maxsize=None)
+def _module(dtype, kappa):
+    import cupy as cp
+
+    ctype = {np.dtype(np.float32): "float", np.dtype(np.float64): "double"}
+    if dtype not in ctype:
+        raise TypeError(f"Stencil backend supports float32/float64, not {dtype}.")
+    prelude = f"typedef {ctype[dtype]} real;\n" + ("#define KAPPA\n" if kappa else "")
+    source = (Path(__file__).parent / "stencil_kernels.cu").read_text()
+    return cp.RawModule(code=prelude + source)
+
+
+def _blocks(size):
+    return ((size + _THREADS_PER_BLOCK - 1) // _THREADS_PER_BLOCK,)
 
 
 class CurlStencil:
@@ -239,38 +265,136 @@ class CurlStencil:
         (``C0.T``).
     dtype : numpy dtype
         Field dtype; must be float32 or float64.
+    kappa : ndarray, optional
+        CPML inverse stretching per derivative direction (``k_h`` or
+        ``k_e``); None without CPML.
     """
 
-    def __init__(self, shape, row, col, periodic, transpose, dtype):
+    def __init__(self, shape, row, col, periodic, transpose, dtype, kappa=None):
         import cupy as cp
 
-        ctype = {np.dtype(np.float32): "float", np.dtype(np.float64): "double"}
-        dtype = np.dtype(dtype)
-        if dtype not in ctype:
-            raise TypeError(f"Stencil backend supports float32/float64, not {dtype}.")
-        source = _KERNEL_SOURCE.replace("REAL", ctype[dtype])
-        name = "curl_bwd" if transpose else "curl_fwd"
-        self._kernel = cp.RawModule(code=source).get_function(name)
+        self.dtype = np.dtype(dtype)
+        module = _module(self.dtype, kappa is not None)
+        self._kernel = module.get_function("curl_bwd" if transpose else "curl_fwd")
         self._cp = cp
-        self.shape = tuple(int(s) for s in shape)
-        self.size = int(np.prod(self.shape))
-        self.row = cp.asarray(row, dtype=dtype)
-        self.col = cp.asarray(col, dtype=dtype)
-        self.dtype = dtype
+        self.size = int(np.prod(shape))
+        self.row = cp.asarray(row, dtype=self.dtype)
+        self.col = cp.asarray(col, dtype=self.dtype)
+        # Unused by the kernel without KAPPA; any valid pointer will do.
+        self.kappa = self.row if kappa is None else cp.asarray(kappa, self.dtype)
         self._args = (
-            *(np.int64(s) for s in self.shape),
+            *(np.int64(s) for s in shape),
             *(np.int32(p) for p in periodic),
         )
-        self._grid = ((self.size + _THREADS_PER_BLOCK - 1) // _THREADS_PER_BLOCK,)
 
     def __matmul__(self, x):
         out = self._cp.empty(3 * self.size, dtype=self.dtype)
         x = self._cp.ascontiguousarray(x, dtype=self.dtype)
         self._kernel(
-            self._grid,
+            _blocks(self.size),
             (_THREADS_PER_BLOCK,),
-            (x, self.row, self.col, out, *self._args),
+            (x, self.row, self.col, self.kappa, out, *self._args),
         )
         return out
 
     __mul__ = __matmul__
+
+
+class CPMLStencil:
+    """GPU CPML convolution updates on the boundary slabs.
+
+    Replaces the psi recursions and boundary corrections of
+    ``SolverFIT3D._one_step_cpml``. The directional derivatives are
+    recomputed from the fields on the slab nodes only, so the 12 directional
+    operators are not needed. The solver's psi attributes are replaced by the
+    GPU arrays that this object updates in place.
+
+    Parameters
+    ----------
+    solver : SolverFIT3D
+        Solver with CPML faces, before the first time step.
+    coefficients : dict of ndarray
+        Output of :func:`curl_stencil_coefficients`.
+    """
+
+    def __init__(self, solver, coefficients):
+        import cupy as cp
+
+        self.dtype = np.dtype(solver.dtype)
+        self._kernel = _module(self.dtype, True).get_function("cpml_psi")
+
+        def upload(values):
+            return cp.asarray(values, dtype=self.dtype)
+
+        self._operands = {
+            "H": tuple(upload(coefficients[k]) for k in ("g_h", "k_h", "c_h")),
+            "E": tuple(upload(coefficients[k]) for k in ("g_e", "k_e", "c_e")),
+        }
+        self._shape = tuple(np.int64(s) for s in (solver.Nx, solver.Ny, solver.Nz))
+        self._periodic = tuple(np.int32(p) for p in periodic_axes(solver))
+        self.faces = []
+        for face in cpml_faces(solver):
+            entry = {"axis": face["axis"]}
+            for field in "HE":
+                names = face[field]
+                arrays = {
+                    key: upload(getattr(solver, name))
+                    for key, name in names.items()
+                    if key != "idx"
+                }
+                arrays["idx"] = cp.asarray(getattr(solver, names["idx"]), cp.int64)
+                # The solver keeps referring to the live psi state.
+                for key in ("psi_a", "psi_b"):
+                    setattr(solver, names[key], arrays[key])
+                entry[field] = arrays
+            self.faces.append(entry)
+
+    def _apply(self, field, target, source, material, scale, t_a, t_b):
+        g, kappa, col = self._operands[field]
+        for face in self.faces:
+            arrays = face[field]
+            # TFSF only modifies derivatives along z (dxz, dyz, dtxz, dtyz).
+            use_t = t_a is not None and face["axis"] == 2
+            size = arrays["idx"].size
+            self._kernel(
+                _blocks(size),
+                (_THREADS_PER_BLOCK,),
+                (
+                    target,
+                    source,
+                    g,
+                    kappa,
+                    col,
+                    material,
+                    arrays["idx"],
+                    arrays["psi_a"],
+                    arrays["psi_b"],
+                    arrays["b"],
+                    arrays["c"],
+                    t_a if use_t else g,
+                    t_b if use_t else g,
+                    np.int64(size),
+                    *self._shape,
+                    np.int32(face["axis"]),
+                    np.int32(field == "E"),
+                    *self._periodic,
+                    np.int32(use_t),
+                    self.dtype.type(scale),
+                ),
+            )
+
+    def update_H(self, H, E, imu, dt, t_a=None, t_b=None):
+        """Advance the H-side psi fields and add their correction to ``H``.
+
+        ``t_a``/``t_b`` are the TFSF terms added to the z-derivatives
+        ``dyzEx`` and ``dxzEy``; None when no injection is active.
+        """
+        self._apply("H", H, E, imu, -dt, t_a, t_b)
+
+    def update_E(self, E, H, ieps, dt, t_a=None, t_b=None):
+        """Advance the E-side psi fields and add their correction to ``E``.
+
+        ``t_a``/``t_b`` are the TFSF terms added to ``dtyzHx`` and
+        ``dtxzHy``; None when no injection is active.
+        """
+        self._apply("E", E, H, ieps, dt, t_a, t_b)

@@ -692,6 +692,10 @@ class BCsMixin:
         )
         self.pml_c_H.fromarray(ratio * (self.pml_b_H.toarray() - 1.0))
 
+        # Kept until the first step for the matrix-free GPU stencil, which
+        # applies the stretching per derivative direction (wakis.stencil).
+        self.ikappa = 1.0 / self.kappa.toarray()
+        self.itkappa = 1.0 / self.tkappa.toarray()
         del (
             self.kappa,
             self.alpha,

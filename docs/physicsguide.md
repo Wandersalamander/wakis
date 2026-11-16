@@ -600,7 +600,14 @@ where $\odot$ is the elementwise product and the vectors correspond to the `Fiel
 
 One kernel thread per primal node computes all three components of $\mathbf{r} \odot \mathbf{C}_0 (\mathbf{c} \odot \mathbf{x})$, or of the transposed product, from neighbouring values. Instead of the sparse matrix's values and indices, it reads two coefficient vectors, roughly halving the bytes moved per product. The update is algebraically identical to the sparse backend; results differ only by floating-point summation order.
 
-The sparse assembly remains the reference implementation. At initialization, `wakis.stencil.check_curl_stencil` rebuilds both factorizations and compares them with the assembled matrices. If a boundary or material model adds a term that is not a diagonal scaling of the curl, the solver raises an error instead of dropping it. CPML uses split directional operators with auxiliary convolution fields, so it is not supported by the stencil backend.
+The sparse assembly remains the reference implementation. At initialization, `wakis.stencil.check_curl_stencil` rebuilds both factorizations and compares them with the assembled matrices. If a boundary or material model adds a term that is not a diagonal scaling of the curl, the solver raises an error instead of dropping it.
+
+With CPML, the sparse backend builds the 12 directional operators $\mathbf{d}_{ca}$ (component $c$, derivative along $a$), e.g. `dxy` $= \operatorname{diag}(\mathbf{a}_x^{-1} \tilde{\boldsymbol{\kappa}}_y^{-1})\, \mathbf{P}_y \operatorname{diag}(\mathbf{b}_z \odot \mathbf{l}_z)$ for $H_x$ from $E_z$. On the E side, `dtxy` uses $-\mathbf{P}_y^T$ and $\boldsymbol{\kappa}_y^{-1}$. These factor in the same way, with the stretching $1/\kappa_a$ attached to the derivative direction. The stencil backend therefore:
+
+1. Evaluates the bulk update with the same kernels, scaling each derivative along $a$ by $1/\kappa_a$, which is 1 outside the layers.
+2. Updates the convolution fields only on the slab nodes of each CPML face normal to $a$. One kernel thread per slab node recomputes the two directional derivatives it needs and applies the recursion $\psi \leftarrow b\,\psi + c\, \mathbf{d}_{ca}\mathbf{x}$. It then adds $\mp \Delta t\, \mu_c^{-1} \psi$ to $H_c$ (respectively $\pm \Delta t\, \varepsilon_c^{-1} \psi$ to $E_c$), with the sign of the corresponding curl term.
+
+TFSF injection adds its incident-field terms to the $z$-derivatives in both parts, as in the sparse step. The 12 directional operators are verified against this factorization at initialization and then discarded.
 
 ```{note}
 #### 👩‍💻 Developer Notes about Wakis
