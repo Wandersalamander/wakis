@@ -161,35 +161,111 @@ extern "C" __global__ void cpml_psi(
 }
 
 #ifndef KAPPA
+// Coefficient access of fused_step. Full: one vector per coefficient.
+// COMPACT: staircase FIT metrics are tensor products, so L_c and tL_c are
+// 1-D tables along axis c, iA_c and itA_c 2-D tables over the two other
+// axes b = c+1, d = c+2 (index pos_b + len_b * pos_d), and the material of
+// entry (c, n) is a 1-byte id into tables of mu^-1, eps^-1 * BC and eps^-1
+// plus the 0/1 mask BC. Both forms give bitwise the same coefficients.
+#ifdef COMPACT
+struct Coefs {
+    const unsigned char* __restrict__ id; const real* __restrict__ T; const unsigned char* __restrict__ bc;
+    const real* __restrict__ L; const real* __restrict__ tL; const real* __restrict__ iA; const real* __restrict__ itA;
+    long long ntab, N, len[3], off1[3], off2[3];
+};
+__device__ inline long long face(const Coefs& K, int c, const long long* pos)
+{
+    const int b = (c + 1) % 3, d = (c + 2) % 3;
+    return K.off2[c] + pos[b] + K.len[b] * pos[d];
+}
+__device__ inline real k_rh(const Coefs& K, int c, long long n, const long long* pos)
+{ return K.iA[face(K, c, pos)] * K.T[K.id[c * K.N + n]]; }
+__device__ inline real k_ch(const Coefs& K, int c, long long n, const long long* pos)
+{ return K.bc[K.id[c * K.N + n]] ? K.L[K.off1[c] + pos[c]] : (real)0; }
+__device__ inline real k_re(const Coefs& K, int c, long long n, const long long* pos)
+{ return K.itA[face(K, c, pos)] * K.T[K.ntab + K.id[c * K.N + n]]; }
+__device__ inline real k_ce(const Coefs& K, int c, long long n, const long long* pos)
+{ return K.tL[K.off1[c] + pos[c]]; }
+__device__ inline real k_ieps(const Coefs& K, int c, long long n, const long long* pos)
+{ return K.T[2 * K.ntab + K.id[c * K.N + n]]; }
+#define COEF_PARAMS \
+    const unsigned char* __restrict__ id, const real* __restrict__ T, const unsigned char* __restrict__ bc, \
+    const long long ntab, const real* __restrict__ L, const real* __restrict__ tL, const real* __restrict__ iA, \
+    const real* __restrict__ itA
+#define COEF_INIT \
+    Coefs K = {id, T, bc, L, tL, iA, itA, ntab, N, {Nx, Ny, Nz}, \
+               {0, Nx, Nx + Ny}, {0, Ny * Nz, Ny * Nz + Nz * Nx}};
+#else
+struct Coefs { const real *__restrict__ rh, *__restrict__ ch, *__restrict__ re, *__restrict__ ce, *__restrict__ ieps; long long N; };
+__device__ inline real k_rh(const Coefs& K, int c, long long n, const long long* pos)
+{ return K.rh[c * K.N + n]; }
+__device__ inline real k_ch(const Coefs& K, int c, long long n, const long long* pos)
+{ return K.ch[c * K.N + n]; }
+__device__ inline real k_re(const Coefs& K, int c, long long n, const long long* pos)
+{ return K.re[c * K.N + n]; }
+__device__ inline real k_ce(const Coefs& K, int c, long long n, const long long* pos)
+{ return K.ce[c * K.N + n]; }
+__device__ inline real k_ieps(const Coefs& K, int c, long long n, const long long* pos)
+{ return K.ieps[c * K.N + n]; }
+#define COEF_PARAMS \
+    const real* __restrict__ rh, const real* __restrict__ ch, const real* __restrict__ re, const real* __restrict__ ce, \
+    const real* __restrict__ ieps
+#define COEF_INIT Coefs K = {rh, ch, re, ce, ieps, N};
+#endif
+
+// (P_a (c_h x_s))[n] for component s: as dfwd, with c_h from the accessor.
+// The curl differentiates component s only along axes other than s, so c_h
+// of s at the forward neighbour nb uses the edge length at n: `pos` (the
+// coordinates of n) serves both nodes.
+//
+// Tuning, measured on an RTX 5060 Ti (sm_120), 256^3: inlining dfwd_k into
+// the full variant doubles its registers (~210) and costs up to 15%, so it
+// stays a real call there. The compact variant is fastest inlined, with the
+// register cap of four 256-thread blocks per SM (see fused_step).
+#ifndef DFWD_ATTR
+#ifdef COMPACT
+#define DFWD_ATTR inline
+#else
+#define DFWD_ATTR __noinline__
+#endif
+#endif
+__device__ DFWD_ATTR real dfwd_k(const real* __restrict__ x, const Coefs& K, int s,
+                       long long n, long long nb, const long long* pos)
+{
+    return nb < 0 ? (real)0 : k_ch(K, s, nb, pos) * x[nb] - k_ch(K, s, n, pos) * x[n];
+}
+
 // Next H component c at node p: H - dt * r_h C0 (c_h E), row c of C0 being
 // +P_{c+1} E_{c+2} - P_{c+2} E_{c+1} (axes and components mod 3).
-__device__ real h_next(const real* E, const real* H, const real* rh,
-                       const real* ch, int c, long long p, const long long* pos,
+__device__ real h_next(const real* __restrict__ E, const real* __restrict__ H,
+                       const Coefs& K, int c, long long p, const long long* pos,
                        const long long* len, const long long* stride,
-                       const int* per, long long N, real dt)
+                       const int* per, real dt)
 {
+    const long long N = K.N;
     const int ap = (c + 1) % 3, an = (c + 2) % 3;
     const long long fp = fwd(p, pos[ap], len[ap], stride[ap], per[ap]);
     const long long fn = fwd(p, pos[an], len[an], stride[an], per[an]);
-    const real curl = dfwd(E + an * N, ch + an * N, p, fp)
-                    - dfwd(E + ap * N, ch + ap * N, p, fn);
-    return H[c * N + p] - dt * (rh[c * N + p] * curl);
+    const real curl = dfwd_k(E + an * N, K, an, p, fp, pos)
+                    - dfwd_k(E + ap * N, K, ap, p, fn, pos);
+    return H[c * N + p] - dt * (k_rh(K, c, p, pos) * curl);
 }
 
-// One complete leapfrog step in a single pass (no CPML):
-//   Ho = H - dt * r_h C0 (c_h E)
-//   Eo = E + dt * (r_e C0.T (c_e Ho) - ieps J)
-// C0.T at node m needs Ho at m and at its backward neighbour along each
-// axis. Each thread owns one (i, j) column and marches k over one chunk of
-// z-planes: Ho at (i, j, k-1) is carried in registers from the previous
-// iteration, the in-plane neighbours (i-1, j, k), (i, j-1, k) and chunk
-// starts or periodic wraps are recomputed from E. No thread depends on
-// another's output, so inputs and outputs must be distinct buffers. The
-// z-march keeps the working set to about one plane per array in cache.
-extern "C" __global__ void fused_step(
-    const real* E, const real* H, real* Eo, real* Ho,
-    const real* rh, const real* ch, const real* re, const real* ce,
-    const real* ieps, const real* J, const real dt,
+// All pointers are __restrict__: inputs and outputs are distinct buffers,
+// and the uint8 material ids (char may alias anything) need not be reloaded
+// after every store. FUSED_MIN_BLOCKS caps the registers so that this many
+// 256-thread blocks fit per SM; uncapped, the compiler uses up to ~230
+// registers and one block per SM keeps too few loads in flight.
+#ifndef FUSED_MIN_BLOCKS
+#ifdef COMPACT
+#define FUSED_MIN_BLOCKS 4
+#else
+#define FUSED_MIN_BLOCKS 3
+#endif
+#endif
+extern "C" __global__ void __launch_bounds__(256, FUSED_MIN_BLOCKS) fused_step(
+    const real* __restrict__ E, const real* __restrict__ H, real* __restrict__ Eo, real* __restrict__ Ho, COEF_PARAMS,
+    const real* __restrict__ J, const real dt,
     const long long Nx, const long long Ny, const long long Nz,
     const int px, const int py, const int pz, const long long chunk)
 {
@@ -202,6 +278,7 @@ extern "C" __global__ void fused_step(
     const long long len[3] = {Nx, Ny, Nz};
     const long long stride[3] = {1, Nx, Nx * Ny};
     const int per[3] = {px, py, pz};
+    COEF_INIT
 
     real carry[3] = {(real)0, (real)0, (real)0};  // c_e * Ho at (i, j, k-1)
     int has_carry = 0;
@@ -212,9 +289,9 @@ extern "C" __global__ void fused_step(
         real cm[3];  // c_e * Ho at m
 #pragma unroll
         for (int c = 0; c < 3; ++c) {
-            const real h = h_next(E, H, rh, ch, c, m, pos, len, stride, per, N, dt);
+            const real h = h_next(E, H, K, c, m, pos, len, stride, per, dt);
             Ho[c * N + m] = h;
-            cm[c] = ce[c * N + m] * h;
+            cm[c] = k_ce(K, c, m, pos) * h;
         }
 
         // D[a][s]: (P_a.T (c_e Ho_s))[m], i.e. dbwd along axis a of component s.
@@ -233,8 +310,9 @@ extern "C" __global__ void fused_step(
                     if (a == 2 && has_carry && nb == m - stride[2])
                         d += carry[s];
                     else
-                        d += ce[s * N + nb]
-                           * h_next(E, H, rh, ch, s, nb, npos, len, stride, per, N, dt);
+                        // tL_s at nb equals tL_s at m (nb differs along a != s).
+                        d += k_ce(K, s, nb, pos)
+                           * h_next(E, H, K, s, nb, npos, len, stride, per, dt);
                 }
                 D[a][s] = d;
             }
@@ -244,8 +322,9 @@ extern "C" __global__ void fused_step(
 #pragma unroll
         for (int c = 0; c < 3; ++c) {
             const int ap = (c + 1) % 3, an = (c + 2) % 3;
-            const real curl = re[c * N + m] * (D[an][ap] - D[ap][an]);
-            Eo[c * N + m] = E[c * N + m] + dt * (curl - ieps[c * N + m] * J[c * N + m]);
+            const real curl = k_re(K, c, m, pos) * (D[an][ap] - D[ap][an]);
+            Eo[c * N + m] = E[c * N + m]
+                          + dt * (curl - k_ieps(K, c, m, pos) * J[c * N + m]);
         }
 
 #pragma unroll

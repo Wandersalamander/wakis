@@ -204,6 +204,108 @@ def check_curl_stencil(solver, coefficients, rtol=None):
             )
 
 
+def compact_coefficients(solver, coefficients):
+    """Return the fused-step coefficients in compact form, or None.
+
+    On the staircase FIT grid, the edge lengths ``L_c``/``tL_c`` vary only
+    along axis ``c`` and the inverse face areas ``iA_c``/``itA_c`` only along
+    the two other axes. Materials and the PEC/periodic mask take few distinct
+    values. The kernel then rebuilds every coefficient from 1-D and 2-D metric
+    tables and a 1-byte material id per entry instead of reading five full
+    vectors, with the same products (see ``stencil_kernels.cu``).
+
+    Parameters
+    ----------
+    solver : SolverFIT3D
+        Solver before the first time step, with CPU-resident ``Field`` data.
+    coefficients : dict of ndarray
+        Output of :func:`curl_stencil_coefficients`, used to verify the
+        compact form.
+
+    Returns
+    -------
+    dict of ndarray or None
+        ``L``, ``tL`` (concatenated 1-D tables), ``iA``, ``itA``
+        (concatenated 2-D tables), ``ids`` (uint8, length ``3*N``),
+        ``table`` (rows mu^-1, eps^-1 * BC, eps^-1) and ``bc`` (uint8 mask
+        per table entry). None when the metrics are not tensor products or
+        there are more than 256 material combinations.
+
+    Raises
+    ------
+    ValueError
+        If the compact form does not reproduce ``coefficients``.
+    """
+    shape = (solver.Nx, solver.Ny, solver.Nz)
+    N = solver.N
+    tables = {}
+    for name, planar in (("L", False), ("tL", False), ("iA", True), ("itA", True)):
+        values = getattr(solver, name).toarray()
+        parts = []
+        for c in range(3):
+            block = values[c * N : (c + 1) * N].reshape(shape, order="F")
+            keep = sorted(((c + 1) % 3, (c + 2) % 3)) if planar else [c]
+            for axis in set(range(3)) - set(keep):
+                if np.ptp(block, axis=axis).any():
+                    return None
+            part = block[tuple(slice(None) if a in keep else 0 for a in range(3))]
+            if planar and (c + 1) % 3 > (c + 2) % 3:
+                part = part.T  # index pos_b + len_b * pos_d with b = c + 1
+            parts.append(part.ravel(order="F"))
+        tables[name] = np.concatenate(parts)
+
+    mask = solver.BC.toarray() if hasattr(solver, "BC") else np.ones(3 * N)
+    if not np.isin(mask, (0, 1)).all():
+        return None
+    imu, ieps = solver.imu.toarray(), solver.ieps.toarray()
+    # Combined integer code of (mu^-1, eps^-1, BC): unique on integers is fast.
+    mu_values, mu_code = np.unique(imu, return_inverse=True)
+    eps_values, eps_code = np.unique(ieps, return_inverse=True)
+    code = (mu_code.astype(np.int64) * eps_values.size + eps_code) * 2
+    code += mask.astype(np.int64)
+    codes, ids = np.unique(code, return_inverse=True)
+    if codes.size > 256:
+        return None
+    entry_mu = mu_values[codes // 2 // eps_values.size]
+    entry_eps = eps_values[codes // 2 % eps_values.size]
+    entry_bc = (codes % 2).astype(np.uint8)
+    compact = dict(
+        tables,
+        ids=ids.ravel().astype(np.uint8),
+        table=np.stack([entry_mu, entry_eps * entry_bc, entry_eps]),
+        bc=entry_bc,
+    )
+    _verify_compact(solver, compact, coefficients)
+    return compact
+
+
+def _verify_compact(solver, compact, coefficients):
+    """Rebuild the full coefficient vectors from ``compact`` and compare."""
+    shape = (solver.Nx, solver.Ny, solver.Nz)
+    index = np.indices(shape).reshape(3, -1, order="F")
+    lengths = np.array(shape)
+    off1 = np.r_[0, np.cumsum(lengths)[:2]]
+    faces = [lengths[(c + 1) % 3] * lengths[(c + 2) % 3] for c in range(3)]
+    off2 = np.r_[0, np.cumsum(faces)[:2]]
+    ids, table, bc = compact["ids"], compact["table"], compact["bc"]
+    rebuilt = {key: [] for key in ("r_h", "c_h", "r_e", "c_e")}
+    for c in range(3):
+        b, d = (c + 1) % 3, (c + 2) % 3
+        face = off2[c] + index[b] + lengths[b] * index[d]
+        line = off1[c] + index[c]
+        entry = ids[c * solver.N : (c + 1) * solver.N]
+        rebuilt["r_h"].append(compact["iA"][face] * table[0][entry])
+        rebuilt["c_h"].append(np.where(bc[entry], compact["L"][line], 0))
+        rebuilt["r_e"].append(compact["itA"][face] * table[1][entry])
+        rebuilt["c_e"].append(compact["tL"][line])
+    for key, parts in rebuilt.items():
+        expected = coefficients[key]
+        error = np.abs(np.concatenate(parts) - expected).max()
+        tol = max(1e-12, 16 * float(np.finfo(np.asarray(expected).dtype).eps))
+        if error > tol * np.abs(expected).max():
+            raise ValueError(f"Compact stencil coefficients do not reproduce {key}.")
+
+
 def cpml_faces(solver):
     """Return, per CPML face, its axis and the solver attribute names it uses.
 
@@ -240,13 +342,15 @@ def cpml_faces(solver):
 
 
 @lru_cache(maxsize=None)
-def _module(dtype, kappa):
+def _module(dtype, kappa, compact=False):
     import cupy as cp
 
     ctype = {np.dtype(np.float32): "float", np.dtype(np.float64): "double"}
     if dtype not in ctype:
         raise TypeError(f"Stencil backend supports float32/float64, not {dtype}.")
-    prelude = f"typedef {ctype[dtype]} real;\n" + ("#define KAPPA\n" if kappa else "")
+    prelude = f"typedef {ctype[dtype]} real;\n"
+    prelude += "#define KAPPA\n" if kappa else ""
+    prelude += "#define COMPACT\n" if compact else ""
     source = (Path(__file__).parent / "stencil_kernels.cu").read_text()
     return cp.RawModule(code=prelude + source)
 
@@ -421,24 +525,44 @@ class FusedStencilStep:
 
     Parameters
     ----------
-    curl_h, curl_e : CurlStencil
-        The solver's ``tDsiDmuiDaC`` and ``itDaiDepsDstC`` stencils, whose
-        coefficient vectors are reused.
-    periodic : tuple of bool
-        Periodic flag per axis.
     shape : tuple of int
         Grid shape ``(Nx, Ny, Nz)``.
+    periodic : tuple of bool
+        Periodic flag per axis.
+    dtype : numpy dtype
+        Field dtype; must be float32 or float64.
+    full : tuple of cupy.ndarray, optional
+        ``(r_h, c_h, r_e, c_e)`` coefficient vectors on the GPU; ``ieps`` is
+        then passed to :meth:`__call__`.
+    compact : dict of ndarray, optional
+        Output of :func:`compact_coefficients`. Exactly one of ``full`` and
+        ``compact`` must be given.
     chunk : int, optional
         Number of z-planes each thread marches through.
     """
 
-    def __init__(self, curl_h, curl_e, periodic, shape, chunk=_FUSED_CHUNK):
+    def __init__(
+        self, shape, periodic, dtype, full=None, compact=None, chunk=_FUSED_CHUNK
+    ):
         import cupy as cp
 
+        if (full is None) == (compact is None):
+            raise ValueError("Pass exactly one of `full` and `compact`.")
         self._cp = cp
-        self.dtype = curl_h.dtype
-        self._kernel = _module(self.dtype, False).get_function("fused_step")
-        self._coefficients = (curl_h.row, curl_h.col, curl_e.row, curl_e.col)
+        self.dtype = np.dtype(dtype)
+        self.compact = compact is not None
+        module = _module(self.dtype, False, self.compact)
+        self._kernel = module.get_function("fused_step")
+        if self.compact:
+            self._operands = (
+                cp.asarray(compact["ids"]),
+                cp.asarray(compact["table"], self.dtype).ravel(),
+                cp.asarray(compact["bc"]),
+                np.int64(compact["table"].shape[1]),
+                *(cp.asarray(compact[k], self.dtype) for k in ("L", "tL", "iA", "itA")),
+            )
+        else:
+            self._operands = tuple(full)
         self.chunk = chunk
         self._grid = (
             -(-shape[0] // _FUSED_BLOCK[0]),
@@ -453,11 +577,15 @@ class FusedStencilStep:
         self._spare = None
 
     def __call__(self, E, H, ieps, J, dt):
-        """Advance ``E`` and ``H`` (wakis ``Field`` objects) by one step."""
+        """Advance ``E`` and ``H`` (wakis ``Field`` objects) by one step.
+
+        ``ieps`` is the GPU vector of eps^-1; only the ``full`` form reads it.
+        """
         cp = self._cp
         if self._spare is None:
             self._spare = (cp.empty_like(E.array), cp.empty_like(H.array))
         E_out, H_out = self._spare
+        operands = self._operands if self.compact else (*self._operands, ieps)
         self._kernel(
             self._grid,
             _FUSED_BLOCK,
@@ -466,8 +594,7 @@ class FusedStencilStep:
                 H.array,
                 E_out,
                 H_out,
-                *self._coefficients,
-                ieps,
+                *operands,
                 J,
                 self.dtype.type(dt),
                 *self._args,

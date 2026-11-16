@@ -527,35 +527,73 @@ def test_gpu_stencil_matches_sparse(use_gpu, bcs, dtype, rtol):
         )
 
 
+FUSED_BOUNDARIES = [
+    b for b in STENCIL_BOUNDARIES if not {"pml", "cpml"} & {*b[0], *b[1]}
+]
+
+
+@pytest.mark.parametrize("bcs", STENCIL_BOUNDARIES)
+def test_compact_stencil_coefficients(bcs):
+    """The heterogeneous STL model on a graded mesh compresses exactly.
+
+    Its metrics are tensor products and it has few material combinations,
+    so ``compact_coefficients`` returns tables that ``_verify_compact``
+    has checked against the full coefficient vectors.
+    """
+    from wakis.stencil import compact_coefficients, curl_stencil_coefficients
+
+    solver = _heterogeneous_solver(bcs)
+    compact = compact_coefficients(solver, curl_stencil_coefficients(solver))
+    assert compact is not None
+    assert compact["ids"].dtype == np.uint8 and compact["ids"].size == 3 * solver.N
+
+
+def test_compact_stencil_rejects_non_separable_metric():
+    """A metric that is not a tensor product keeps the full vectors."""
+    from wakis.stencil import compact_coefficients, curl_stencil_coefficients
+
+    solver = make_solver(["pec"] * 3)
+    coefficients = curl_stencil_coefficients(solver)
+    values = solver.L.toarray().copy()
+    values[solver.N // 2] *= 1.5  # one L_x entry off its 1-D profile
+    solver.L.fromarray(values)
+    assert compact_coefficients(solver, coefficients) is None
+
+
+@pytest.mark.parametrize("compact", [True, False], ids=["compact", "full"])
 @pytest.mark.parametrize("chunk", [1, 3, 16])
-@pytest.mark.parametrize(
-    "bcs", [b for b in STENCIL_BOUNDARIES if not {"pml", "cpml"} & {*b[0], *b[1]}]
-)
-def test_gpu_fused_step_matches_two_kernel_step(use_gpu, bcs, chunk):
+@pytest.mark.parametrize("bcs", FUSED_BOUNDARIES)
+def test_gpu_fused_step_matches_two_kernel_step(
+    use_gpu, monkeypatch, bcs, chunk, compact
+):
     """The single-pass fused step equals the two-kernel stencil step.
 
     ``fused_step`` carries the new H of plane k-1 in registers and recomputes
     it at chunk starts and periodic wraps; chunk lengths 1 and 3 put chunk
-    boundaries on every few planes so both paths are compared. The
-    conductive shell keeps the J term active.
+    boundaries on every few planes so both paths are compared. The compact
+    variant rebuilds the coefficients from metric tables and material ids;
+    the reference always uses the full vectors. The conductive shell keeps
+    the J term active.
     """
     if not use_gpu:
         pytest.skip("requires --gpu")
-    from wakis.stencil import FusedStencilStep, periodic_axes
+    import functools
+
+    import wakis.solverFIT3D as solver_module
 
     fields = {}
     for mode in ("two-kernel", "fused"):
-        solver = _heterogeneous_solver(bcs, use_gpu=True, gpu_backend="stencil")
-        assert hasattr(solver, "fused_step")
-        if mode == "fused":
-            solver.fused_step = FusedStencilStep(
-                solver.tDsiDmuiDaC,
-                solver.itDaiDepsDstC,
-                periodic_axes(solver),
-                (solver.Nx, solver.Ny, solver.Nz),
-                chunk,
+        with monkeypatch.context() as patch:
+            patch.setattr(
+                solver_module,
+                "FusedStencilStep",
+                functools.partial(solver_module.FusedStencilStep, chunk=chunk),
             )
-        else:
+            if mode == "two-kernel" or not compact:
+                patch.setattr(solver_module, "compact_coefficients", lambda *a: None)
+            solver = _heterogeneous_solver(bcs, use_gpu=True, gpu_backend="stencil")
+        assert solver.fused_step.compact == (compact and mode == "fused")
+        if mode == "two-kernel":
             # Swap only the innermost step; the ABC wrapper sits inside the
             # periodic wrapper.
             for name in ("_one_step_backend", "_one_step_periodic", "one_step"):

@@ -3,18 +3,22 @@
 # Copyright (c) CERN, 2026.                   #
 # ########################################### #
 
-"""Compare the GPU curl backends of SolverFIT3D: sparse (cuSPARSE) vs. stencil.
+"""Compare the GPU backends of SolverFIT3D: sparse (cuSPARSE) vs. stencil.
 
-The FIT time step is memory-bandwidth bound: each curl product touches every
-field value once and does only a few flops with it. The ``'sparse'`` backend
-streams the matrix values and indices from GPU memory on every product. The
-matrix-free ``'stencil'`` backend reads only the field and two coefficient
-vectors. This script times both backends on a PEC box and reports the
-effective bandwidth of the curl product against the card's peak.
+The FIT time step is memory-bandwidth bound: it touches every field value a
+few times and does only a few flops with it. The ``'sparse'`` backend streams
+the curl matrices' values and indices from GPU memory twice per step, plus
+the elementwise update passes. Without CPML, TFSF or MPI, the ``'stencil'``
+backend runs the whole step as one fused kernel that reads E, H, J and, on
+staircase grids with few materials, only 1-D/2-D metric tables and a 1-byte
+material id per entry. This script times both backends on a PEC box and
+reports the time per step, the GPU memory held by the solver, and for the
+sparse backend the effective bandwidth of one curl product.
 
 Usage: ``python 007_GPU_backend_benchmark.py [N_cells_per_axis] [float32|float64]``
 """
 
+import gc
 import sys
 import time
 
@@ -29,8 +33,15 @@ n_steps = 200
 
 
 def gpu_time(function, repeats):
-    """Mean GPU time of ``function()`` in seconds, measured with CUDA events."""
-    function()  # warm-up: kernel compilation and memory pool growth
+    """Mean GPU time of ``function()`` in seconds, measured with CUDA events.
+
+    Warms up for 1 s first: after the CPU-bound solver setup the GPU is at
+    idle clocks, which would distort short measurements.
+    """
+    t0 = time.perf_counter()
+    while time.perf_counter() - t0 < 1.0:
+        function()
+        cp.cuda.Device().synchronize()
     start, stop = cp.cuda.Event(), cp.cuda.Event()
     start.record()
     for _ in range(repeats):
@@ -40,12 +51,10 @@ def gpu_time(function, repeats):
     return cp.cuda.get_elapsed_time(start, stop) / 1e3 / repeats
 
 
-def curl_bytes(operator, size, itemsize):
-    """Minimum bytes moved by one curl product (each array read/written once)."""
+def csr_curl_bytes(operator, size, itemsize):
+    """Minimum bytes moved by one CSR curl product (each array read once)."""
     vectors = 2 * 3 * size * itemsize  # read x, write out
-    if hasattr(operator, "nnz"):  # CSR: values, column indices, row pointers
-        return vectors + operator.nnz * (itemsize + 4) + (3 * size + 1) * 4
-    return vectors + 2 * 3 * size * itemsize  # row and column coefficients
+    return vectors + operator.nnz * (itemsize + 4) + (3 * size + 1) * 4
 
 
 properties = cp.cuda.runtime.getDeviceProperties(0)
@@ -56,6 +65,7 @@ print(f"{peak / 1e9:.0f} GB/s" if peak else "unknown")
 
 grid = GridFIT3D(0, 1, 0, 1, 0, 1, n_cells, n_cells, n_cells, verbose=0)
 initial = np.random.default_rng(0).normal(size=3 * grid.Nx * grid.Ny * grid.Nz)
+pool = cp.get_default_memory_pool()
 results = {}
 for backend in ("sparse", "stencil"):
     t0 = time.time()
@@ -70,25 +80,32 @@ for backend in ("sparse", "stencil"):
     )
     setup = time.time() - t0
     solver.E.fromarray(cp.asarray(initial, dtype=dtype))
-    operator, x = solver.tDsiDmuiDaC, solver.E.array
 
-    # Steps first: they bring the GPU to full clocks after the CPU-bound setup,
-    # otherwise the short curl measurement runs partly at idle clocks.
-    t_step = gpu_time(solver.one_step, n_steps)
-    t_curl = gpu_time(lambda: operator * x, 200)
-    bandwidth = curl_bytes(operator, solver.N, dtype.itemsize) / t_curl
+    # Fixed step count before the timing, so both backends end at the same
+    # time level and their fields can be compared below.
+    for _ in range(n_steps):
+        solver.one_step()
+    memory = pool.used_bytes()  # after the first steps allocated everything
     results[backend] = [field.toarray().get() for field in (solver.E, solver.H)]
+    t_step = gpu_time(solver.one_step, n_steps)
 
-    print(
-        f"{backend:>8}: setup {setup:6.2f} s | curl {t_curl * 1e3:7.3f} ms "
-        f"({bandwidth / 1e9:6.1f} GB/s"
-        + (f", {100 * bandwidth / peak:4.1f}% of peak)" if peak else ")")
-        + f" | step {t_step * 1e3:7.3f} ms ({solver.N / t_step / 1e6:7.1f} Mcells/s)"
+    line = (
+        f"{backend:>8}: setup {setup:6.2f} s | GPU memory {memory / 1e9:5.2f} GB"
+        f" | step {t_step * 1e3:7.3f} ms ({solver.N / t_step / 1e6:7.1f} Mcells/s)"
     )
-    del solver, operator, x
-    cp.get_default_memory_pool().free_all_blocks()
+    operator = solver.tDsiDmuiDaC
+    if hasattr(operator, "nnz"):
+        x = solver.E.array
+        t_curl = gpu_time(lambda: operator * x, 200)
+        bandwidth = csr_curl_bytes(operator, solver.N, dtype.itemsize) / t_curl
+        line += f" | curl {t_curl * 1e3:7.3f} ms ({bandwidth / 1e9:6.1f} GB/s"
+        line += f", {100 * bandwidth / peak:4.1f}% of peak)" if peak else ")"
+    print(line)
+    del solver, operator
+    gc.collect()  # the solver holds reference cycles (bound step methods)
+    pool.free_all_blocks()
 
-# Same fields after the timed steps: the stencil reproduces the sparse operator.
+# Same fields after the same number of steps: the stencil reproduces sparse.
 for name, sparse, stencil in zip("EH", results["sparse"], results["stencil"]):
     error = np.abs(stencil - sparse).max() / np.abs(sparse).max()
     print(f"max relative difference in {name}: {error:.2e}")

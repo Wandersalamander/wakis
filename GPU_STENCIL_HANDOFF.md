@@ -21,6 +21,19 @@ Branch: `feature/gpu-stencil-backend`. Written on a machine without an NVIDIA GP
   Modelled fused traffic (10 vectors/step) is 83–86% of the 448 GB/s peak. CSR beats the old CSC on the sparse path, so keep it. CPML/TFSF stencil steps are not benchmarked.
 - Open: at 256³, `check_curl_stencil` takes ~23 s of the stencil setup; Nsight Compute 2025.1 can't read counters with driver R621 (`LibraryNotLoaded`).
 
+## Stacked branch `feature/gpu-compact-coefficients`
+
+The fused step reads 1-D/2-D metric tables and a uint8 material id per entry instead of the five coefficient vectors when the model allows it (`compact_coefficients`, verified against the full vectors at setup). Kernel tuning per variant: `__launch_bounds__` (3 blocks/SM full, 4 compact), `dfwd_k` a real call in the full variant, inlined in the compact one, and `__restrict__` throughout. Same method as above, ms/step and GPU memory held by the solver:
+
+| case | full fused | compact fused | vs. full | vs. upstream | GPU memory full → compact |
+|---|---|---|---|---|---|
+| 128³ f64 | 1.29 | 1.07 | 1.21× | 6.8× | 0.60 → 0.41 GB |
+| 128³ f32 | 0.65 | 0.54 | 1.20× | 7.5× | 0.30 → 0.21 GB |
+| 256³ f64 | 10.5 | 7.96 | 1.32× | 7.4× | 4.83 → 3.27 GB |
+| 256³ f32 | 5.18 | 4.07 | 1.27× | 8.6× | 2.42 → 1.66 GB |
+
+Fields match upstream to ≤5e-15 (f64) / ≤2e-6 (f32) after 100 steps. The compact kernel reaches only ~58% of peak on its reduced traffic: it is bound by dependent id → table loads (78 byte loads per node in SASS) and index arithmetic, not by bandwidth. Possible next steps: pack the three component ids of a node into one 32-bit word, 32-bit index arithmetic, and keeping `ieps`, `sigma` and `J_old` off the GPU when there is no conductivity (~3 vectors of memory).
+
 ## What the branch changes
 
 1. **`gpu_backend='stencil'`** (new `SolverFIT3D` argument, default `'sparse'`). `wakis/stencil.py` replaces the two cupyx curl matrices (`tDsiDmuiDaC`, `itDaiDepsDstC`) with `CurlStencil` objects. These run matrix-free CUDA kernels and act as drop-in operators for `op * x`. Every existing non-CPML step path (`_one_step`, `_mpi_one_step`, TFSF, conductivity, ABC and periodic wrappers) is unchanged. The math is in `docs/physicsguide.md`, section *Matrix-free GPU stencil*.

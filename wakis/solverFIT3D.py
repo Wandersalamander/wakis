@@ -24,6 +24,7 @@ from .stencil import (
     CurlStencil,
     FusedStencilStep,
     check_curl_stencil,
+    compact_coefficients,
     curl_stencil_coefficients,
     periodic_axes,
 )
@@ -650,6 +651,20 @@ class SolverFIT3D(PlotMixin, RoutinesMixin, BCsMixin):
         check_curl_stencil(self, coefficients)
         shape = (self.Nx, self.Ny, self.Nz)
         periodic = periodic_axes(self)
+        # TFSF injects between the H and E updates and MPI exchanges halos
+        # there, so only the plain step runs as a single pass.
+        fused = not (self.activate_cpml or self.source_type == "tfsf" or self.use_mpi)
+        compact = compact_coefficients(self, coefficients) if fused else None
+        if compact is not None:
+            # The compact fused step needs no full coefficient vectors.
+            self.tDsiDmuiDaC = self.itDaiDepsDstC = None
+            self.fused_step = FusedStencilStep(
+                shape, periodic, self.dtype, compact=compact
+            )
+            self.one_step = self._one_step_fused_stencil
+            return
+        if fused and self.verbose:
+            print("Stencil coefficients are not compressible; using full vectors.")
         k_h, k_e = coefficients.get("k_h"), coefficients.get("k_e")
         self.tDsiDmuiDaC = CurlStencil(
             shape,
@@ -670,11 +685,15 @@ class SolverFIT3D(PlotMixin, RoutinesMixin, BCsMixin):
             kappa=k_e,
         )
         if not self.activate_cpml:
-            # TFSF injects between the H and E updates and MPI exchanges
-            # halos there, so only the plain step runs as a single pass.
-            if self.source_type != "tfsf" and not self.use_mpi:
+            if fused:
+                full = (
+                    self.tDsiDmuiDaC.row,
+                    self.tDsiDmuiDaC.col,
+                    self.itDaiDepsDstC.row,
+                    self.itDaiDepsDstC.col,
+                )
                 self.fused_step = FusedStencilStep(
-                    self.tDsiDmuiDaC, self.itDaiDepsDstC, periodic, shape
+                    shape, periodic, self.dtype, full=full
                 )
                 self.one_step = self._one_step_fused_stencil
             return
